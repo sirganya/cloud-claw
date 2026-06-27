@@ -37,12 +37,10 @@ jobs:
         run: pnpm install --frozen-lockfile
         timeout-minutes: 30
       
-      - name: Build (tsdown with minimal logging)
+      - name: Build (ciArtifacts profile - minimal)
         working-directory: openclaw-dist
-        run: NODE_OPTIONS=--max-old-space-size=6144 pnpm build
+        run: NODE_OPTIONS=--max-old-space-size=6144 pnpm build ciArtifacts
         timeout-minutes: 120
-        env:
-          TSDOWN_LOG_LEVEL: error
       
       - name: Upload dist artifact
         uses: actions/upload-artifact@v4
