@@ -10,13 +10,17 @@ WORKDIR /app
 
 ARG OPENCLAW_GIT_REF=main
 
-RUN git clone --depth 1 --branch "${OPENCLAW_GIT_REF}" https://github.com/openclaw/openclaw.git .
+RUN git clone --depth 1 --branch "${OPENCLAW_GIT_REF}" https://github.com/sirganya/openclaw.git .
+
+# 1. Force pnpm to copy files instead of hard-linking them
+RUN pnpm config set package-import-method copy
+
+# 2. Force pnpm to use a local, writeable virtual store directory inside the container
+RUN pnpm config set virtual-store-dir /app/node_modules/.pnpm
 
 RUN pnpm install --frozen-lockfile
-RUN pnpm build
 
 ENV OPENCLAW_PREFER_PNPM=1
-RUN pnpm ui:install && pnpm ui:build
 
 FROM nikolaik/python-nodejs:python3.12-nodejs22-bookworm
 
@@ -32,12 +36,19 @@ RUN set -eux; \
 		ca-certificates \
 		curl; \
 	corepack enable pnpm; \
-	curl -fsSL "https://github.com/tigrisdata/tigrisfs/releases/download/v${TIGRISFS_VERSION}/tigrisfs_${TIGRISFS_VERSION}_linux_amd64.deb" -o /tmp/tigrisfs.deb; \
-	dpkg -i /tmp/tigrisfs.deb; \
-	rm -f /tmp/tigrisfs.deb; \
+	if [ "$(uname -m)" = "x86_64" ]; then \
+		curl -fsSL "https://github.com/tigrisdata/tigrisfs/releases/download/v${TIGRISFS_VERSION}/tigrisfs_${TIGRISFS_VERSION}_linux_amd64.deb" -o /tmp/tigrisfs.deb; \
+		dpkg -i /tmp/tigrisfs.deb; \
+		rm -f /tmp/tigrisfs.deb; \
+	else \
+		echo "tigrisfs not available for arm64"; \
+	fi; \
 	rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
-COPY --from=openclaw-build /app /openclaw
+# Copy pre-built dist and node_modules from CI build
+COPY dist/ /openclaw/dist/
+COPY --from=openclaw-build /app/node_modules /openclaw/node_modules
+COPY --from=openclaw-build /app/package.json /openclaw/package.json
 
 RUN printf '%s\n' '#!/usr/bin/env bash' 'exec node /openclaw/dist/index.js "$@"' > /usr/local/bin/openclaw \
 	&& chmod +x /usr/local/bin/openclaw
