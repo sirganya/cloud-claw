@@ -3,8 +3,7 @@ name: Build OpenClaw Dist
 on:
   push:
     branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
+  workflow_dispatch:
 
 jobs:
   build-dist:
@@ -12,42 +11,42 @@ jobs:
     timeout-minutes: 120
     
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout cloud-claw repo
+        uses: actions/checkout@v4
       
       - name: Install Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          node-version: '22'
       
       - name: Install pnpm
-        run: corepack enable && corepack prepare pnpm@latest --activate
+        run: corepack enable && corepack prepare pnpm@10.28.2 --activate
       
-      - name: Clone OpenClaw
-        run: |
-          rm -rf openclaw-dist
-          mkdir openclaw-dist
-          cd openclaw-dist
-          git clone --depth 1 https://github.com/sirganya/openclaw.git .
+      - name: Checkout OpenClaw fork
+        uses: actions/checkout@v4
+        with:
+          repository: sirganya/openclaw
+          path: openclaw-dist
       
       - name: Configure pnpm
+        working-directory: openclaw-dist
         run: |
-          cd openclaw-dist
           pnpm config set package-import-method copy
           pnpm config set virtual-store-dir ./node_modules/.pnpm
       
       - name: Install dependencies
-        run: cd openclaw-dist && pnpm install --frozen-lockfile
+        working-directory: openclaw-dist
+        run: pnpm install --frozen-lockfile
         timeout-minutes: 30
       
       - name: Build (tsdown)
-        run: |
-          cd openclaw-dist
-          NODE_OPTIONS=--max-old-space-size=4096 pnpm build
+        working-directory: openclaw-dist
+        run: NODE_OPTIONS=--max-old-space-size=4096 pnpm build
         timeout-minutes: 90
       
       - name: Build UI
+        working-directory: openclaw-dist
         run: |
-          cd openclaw-dist
           NODE_OPTIONS=--max-old-space-size=2048 pnpm ui:install
           NODE_OPTIONS=--max-old-space-size=2048 pnpm ui:build
         timeout-minutes: 30
@@ -57,11 +56,4 @@ jobs:
         with:
           name: openclaw-dist
           path: openclaw-dist/dist/
-          retention-days: 7
-      
-      - name: Upload node_modules artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: openclaw-node_modules
-          path: openclaw-dist/node_modules/
           retention-days: 7
