@@ -22,11 +22,9 @@ jobs:
       - name: Install pnpm
         run: corepack enable && corepack prepare pnpm@10.28.2 --activate
       
-      - name: Checkout OpenClaw fork
-        uses: actions/checkout@v4
-        with:
-          repository: sirganya/openclaw
-          path: openclaw-dist
+      - name: Clone OpenClaw (main repo)
+        run: |
+          git clone --depth 1 https://github.com/openclaw/openclaw.git openclaw-dist
       
       - name: Configure pnpm
         working-directory: openclaw-dist
