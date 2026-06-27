@@ -1,0 +1,2 @@
+import { a as resolvePluginMetadataSnapshot, i as loadPluginMetadataSnapshot, n as isPluginMetadataSnapshotCompatible, o as resolvePluginMetadataSnapshotMemoEnvFingerprint, r as listPluginOriginsFromMetadataSnapshot, t as clearLoadPluginMetadataSnapshotMemo } from "./plugin-metadata-snapshot-BcB4RJD7.js";
+export { clearLoadPluginMetadataSnapshotMemo, isPluginMetadataSnapshotCompatible, listPluginOriginsFromMetadataSnapshot, loadPluginMetadataSnapshot, resolvePluginMetadataSnapshot, resolvePluginMetadataSnapshotMemoEnvFingerprint };
