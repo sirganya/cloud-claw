@@ -1,33 +1,10 @@
-FROM node:22-bookworm AS openclaw-build
-
-# Install Bun (build script dependency)
-RUN curl -fsSL https://bun.sh/install | bash
-ENV PATH="/root/.bun/bin:${PATH}"
-
-RUN corepack enable
-
-WORKDIR /app
-
-ARG OPENCLAW_GIT_REF=main
-
-RUN git clone --depth 1 --branch "${OPENCLAW_GIT_REF}" https://github.com/sirganya/openclaw.git .
-
-# 1. Force pnpm to copy files instead of hard-linking them
-RUN pnpm config set package-import-method copy
-
-# 2. Force pnpm to use a local, writeable virtual store directory inside the container
-RUN pnpm config set virtual-store-dir /app/node_modules/.pnpm
-
-RUN pnpm install --frozen-lockfile
-
-ENV OPENCLAW_PREFER_PNPM=1
-
 FROM nikolaik/python-nodejs:python3.12-nodejs22-bookworm
 
 ENV NODE_ENV=production
 ENV PORT=6658
 
 ARG TIGRISFS_VERSION=1.2.1
+ARG GOGCLI_VERSION=0.31.1
 
 RUN set -eux; \
 	apt-get update; \
@@ -43,70 +20,149 @@ RUN set -eux; \
 	else \
 		echo "tigrisfs not available for arm64"; \
 	fi; \
+	curl -fsSL "https://github.com/openclaw/gogcli/releases/download/v${GOGCLI_VERSION}/gogcli_${GOGCLI_VERSION}_linux_amd64.tar.gz" -o /tmp/gogcli.tar.gz; \
+	tar -xzf /tmp/gogcli.tar.gz -C /usr/local/bin gog; \
+	rm -f /tmp/gogcli.tar.gz; \
 	rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
-# Copy pre-built dist and node_modules from CI build
-COPY dist/ /openclaw/dist/
-COPY --from=openclaw-build /app/node_modules /openclaw/node_modules
-COPY --from=openclaw-build /app/package.json /openclaw/package.json
+# node_modules split into layers by size (~2.3GB total)
+# Layer 1: largest scoped packages (~650MB)
+COPY openclaw-build/node_modules/@github /openclaw/node_modules/@github
+COPY openclaw-build/node_modules/@anthropic-ai /openclaw/node_modules/@anthropic-ai
+# Layer 2: AI/ML packages (~520MB)
+COPY openclaw-build/node_modules/@openai /openclaw/node_modules/@openai
+COPY openclaw-build/node_modules/@zed-industries /openclaw/node_modules/@zed-industries
+COPY openclaw-build/node_modules/openclaw /openclaw/node_modules/openclaw
+COPY openclaw-build/node_modules/@lancedb /openclaw/node_modules/@lancedb
+# Layer 3: remaining scoped packages
+COPY openclaw-build/node_modules/@tloncorp /openclaw/node_modules/@tloncorp
+COPY openclaw-build/node_modules/@opentelemetry /openclaw/node_modules/@opentelemetry
+COPY openclaw-build/node_modules/@azure /openclaw/node_modules/@azure
+COPY openclaw-build/node_modules/@typescript /openclaw/node_modules/@typescript
+COPY openclaw-build/node_modules/@larksuiteoapi /openclaw/node_modules/@larksuiteoapi
+COPY openclaw-build/node_modules/@slack /openclaw/node_modules/@slack
+COPY openclaw-build/node_modules/@mistralai /openclaw/node_modules/@mistralai
+COPY openclaw-build/node_modules/@pierre /openclaw/node_modules/@pierre
+# Layer 4: everything else
+COPY openclaw-build/node_modules /openclaw/node_modules
+
+# Source and config files
+COPY openclaw-build/extensions /openclaw/extensions
+COPY openclaw-build/package.json /openclaw/package.json
+COPY openclaw-build/pnpm-workspace.yaml /openclaw/pnpm-workspace.yaml
+COPY openclaw-build/openclaw.mjs /openclaw/openclaw.mjs
+COPY openclaw-build/packages /openclaw/packages
+COPY openclaw-build/src /openclaw/src
+
+# Pre-built dist artifacts (overlay last so they win)
+COPY openclaw-build/dist/ /openclaw/dist/
+
+# Workspace templates
+COPY openclaw-build/docs/reference/templates/ /openclaw/src/agents/templates/
+
+# Patch: skip secret-dir permission check on FUSE mounts (TigrisFS ignores chmod)
+RUN sed -i 's/if (process.platform === "win32") return;/if (process.platform === "win32" || process.env.OPENCLAW_SKIP_FS_PERMISSION_CHECK === "1") return;/' /openclaw/dist/secret-file-*.js
+COPY openclaw-build/dist-runtime/ /openclaw/dist-runtime/
 
 RUN printf '%s\n' '#!/usr/bin/env bash' 'exec node /openclaw/dist/index.js "$@"' > /usr/local/bin/openclaw \
 	&& chmod +x /usr/local/bin/openclaw
+
+RUN apt-get update && apt-get install -y --no-install-recommends rsync && rm -rf /var/lib/apt/lists/*
 
 RUN install -m 755 /dev/stdin /entrypoint.sh <<'EOF'
 #!/bin/bash
 set -e
 
-MOUNT_POINT="/data"
+R2_MOUNT="/r2"
+STATE_DIR="/data"
 
-# State directory corresponds to ~/.openclaw (contains config, credentials, sessions)
-# Workspace defaults to $OPENCLAW_STATE_DIR/workspace per docs
-export OPENCLAW_STATE_DIR="$MOUNT_POINT"
-export OPENCLAW_WORKSPACE_DIR="$MOUNT_POINT/workspace"
+# State on LOCAL disk — fast, consistent reads/writes for sessions and SQLite
+# R2 for durable backup only (credentials, workspace, agent history)
+export OPENCLAW_STATE_DIR="$STATE_DIR"
+export OPENCLAW_WORKSPACE_DIR="$STATE_DIR/workspace"
+export OPENCLAW_SKIP_FS_PERMISSION_CHECK=1
 
-setup_workspace() {
-	mkdir -p "$OPENCLAW_WORKSPACE_DIR"
-}
+mkdir -p "$STATE_DIR" "$STATE_DIR/workspace"
 
-reset_mountpoint() {
-	mountpoint -q "$MOUNT_POINT" 2>/dev/null && fusermount -u "$MOUNT_POINT" 2>/dev/null || true
-	rm -rf "$MOUNT_POINT"
-	mkdir -p "$MOUNT_POINT"
-}
+mount_r2() {
+	mountpoint -q "$R2_MOUNT" 2>/dev/null && fusermount -u "$R2_MOUNT" 2>/dev/null || true
+	rm -rf "$R2_MOUNT"
+	mkdir -p "$R2_MOUNT"
 
-reset_mountpoint
-
-if [ -z "$S3_ENDPOINT" ] || [ -z "$S3_BUCKET" ] || [ -z "$S3_ACCESS_KEY_ID" ] || [ -z "$S3_SECRET_ACCESS_KEY" ]; then
-	echo "[WARN] S3 configuration incomplete, using local directory mode"
-else
-	echo "[INFO] Mounting S3: ${S3_BUCKET} -> ${MOUNT_POINT}"
+	if [ -z "$S3_ENDPOINT" ] || [ -z "$S3_BUCKET" ] || [ -z "$S3_ACCESS_KEY_ID" ] || [ -z "$S3_SECRET_ACCESS_KEY" ]; then
+		echo "[WARN] S3 not configured, no durable backup"
+		return 1
+	fi
 
 	export AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY_ID"
 	export AWS_SECRET_ACCESS_KEY="$S3_SECRET_ACCESS_KEY"
 	export AWS_REGION="${S3_REGION:-auto}"
 	export AWS_S3_PATH_STYLE="${S3_PATH_STYLE:-false}"
 
-	/usr/bin/tigrisfs --endpoint "$S3_ENDPOINT" ${TIGRISFS_ARGS:-} -f "${S3_BUCKET}${S3_PREFIX:+:$S3_PREFIX}" "$MOUNT_POINT" &
+	/usr/bin/tigrisfs \
+		--endpoint "$S3_ENDPOINT" \
+		--memory-limit 2048 \
+		--max-flushers 32 \
+		--stat-cache-ttl 15m \
+		${TIGRISFS_ARGS:-} \
+		-f "${S3_BUCKET}${S3_PREFIX:+:$S3_PREFIX}" "$R2_MOUNT" &
 	sleep 3
 
-	if ! mountpoint -q "$MOUNT_POINT"; then
-		echo "[ERROR] S3 mount failed"
-		exit 1
+	if ! mountpoint -q "$R2_MOUNT"; then
+		echo "[ERROR] R2 mount failed"
+		return 1
 	fi
-	echo "[OK] S3 mounted successfully"
-fi
+	echo "[OK] R2 mounted at $R2_MOUNT"
+	return 0
+}
 
-setup_workspace
+restore_from_r2() {
+	echo "[INFO] Restoring state from R2..."
+	for dir in credentials workspace agents; do
+		if [ -d "$R2_MOUNT/$dir" ]; then
+			mkdir -p "$STATE_DIR/$dir"
+			rsync -a --exclude='openclaw.json' --exclude='openclaw.json.bak' "$R2_MOUNT/$dir/" "$STATE_DIR/$dir/" 2>/dev/null || true
+			echo "[INFO] Restored $dir"
+		fi
+	done
+}
+
+backup_to_r2() {
+	while true; do
+		sleep 300
+		if mountpoint -q "$R2_MOUNT" 2>/dev/null; then
+			for dir in workspace credentials agents; do
+				if [ -d "$STATE_DIR/$dir" ]; then
+					rsync -a --delete "$STATE_DIR/$dir/" "$R2_MOUNT/$dir/" 2>/dev/null || true
+				fi
+			done
+		fi
+	done
+}
+
+R2_AVAILABLE=false
+if mount_r2; then
+	R2_AVAILABLE=true
+	restore_from_r2
+	backup_to_r2 &
+	BACKUP_PID=$!
+fi
 
 cleanup() {
 	echo "[INFO] Shutting down..."
+	# Final backup
+	if [ "$R2_AVAILABLE" = "true" ] && mountpoint -q "$R2_MOUNT" 2>/dev/null; then
+		echo "[INFO] Final backup to R2..."
+		for dir in workspace credentials agents; do
+			[ -d "$STATE_DIR/$dir" ] && rsync -a --delete "$STATE_DIR/$dir/" "$R2_MOUNT/$dir/" 2>/dev/null || true
+		done
+	fi
+	[ -n "$BACKUP_PID" ] && kill "$BACKUP_PID" 2>/dev/null
 	if [ -n "$OPENCLAW_PID" ]; then
 		kill -TERM "$OPENCLAW_PID" 2>/dev/null
 		wait "$OPENCLAW_PID" 2>/dev/null
 	fi
-	if mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
-		fusermount -u "$MOUNT_POINT" 2>/dev/null || true
-	fi
+	mountpoint -q "$R2_MOUNT" 2>/dev/null && fusermount -u "$R2_MOUNT" 2>/dev/null || true
 	exit 0
 }
 trap cleanup SIGTERM SIGINT
@@ -117,19 +173,40 @@ else
 	echo "[WARN] OPENCLAW_GATEWAY_TOKEN not set, will be auto-generated"
 fi
 
-if [ ! -f "$OPENCLAW_STATE_DIR/openclaw.json" ]; then
-	cat > "$OPENCLAW_STATE_DIR/openclaw.json" << 'EOFCONFIG'
+# Google Chat setup: install plugin, write service account, patch config
+if [ -n "$GOOGLE_CHAT_SERVICE_ACCOUNT" ]; then
+	echo "$GOOGLE_CHAT_SERVICE_ACCOUNT" > "$STATE_DIR/googlechat-sa.json"
+	echo "[INFO] Google Chat service account written"
+fi
+
+# Always write config (overwrite stale R2-persisted config from previous deploys)
+cat > "$OPENCLAW_STATE_DIR/openclaw.json" << EOFCONFIG
 {
   "gateway": {
     "mode": "local",
     "bind": "lan",
     "port": 6658,
     "auth": {
-      "mode": "token"
+      "mode": "token",
+      "token": "${OPENCLAW_GATEWAY_TOKEN}"
     },
+    "trustedProxies": ["10.0.0.0/8"],
     "controlUi": {
-      "allowInsecureAuth": true
+      "allowInsecureAuth": true,
+      "allowedOrigins": ["${WORKER_URL}"],
+      "dangerouslyAllowHostHeaderOriginFallback": true,
+      "dangerouslyDisableDeviceAuth": true
     }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "google/gemini-3.5-flash"
+      }
+    }
+  },
+  "memorySearch": {
+    "provider": "gemini"
   },
   "browser": {
     "enabled": true,
@@ -148,7 +225,64 @@ if [ ! -f "$OPENCLAW_STATE_DIR/openclaw.json" ]; then
   }
 }
 EOFCONFIG
-	echo "[INFO] Default config file created (local mode + allowInsecureAuth)"
+echo "[INFO] Config written to $OPENCLAW_STATE_DIR/openclaw.json"
+
+# Seed MEMORY.md with operational context — only if it doesn't already exist
+if [ ! -f "$OPENCLAW_WORKSPACE_DIR/MEMORY.md" ]; then
+cat > "$OPENCLAW_WORKSPACE_DIR/MEMORY.md" << 'EOFMEMORY'
+# System Memory
+
+## Config file: /data/openclaw.json — BE VERY CAREFUL
+
+On 2026-06-29 and 2026-06-30 the gateway crashed multiple times because the AI modified openclaw.json incorrectly:
+
+1. **Gateway token changed** — the token in `gateway.auth.token` must match the Worker proxy. Changing it breaks all auth and locks you out.
+2. **Invalid channel config added** — adding `channels.googlechat` with an invalid `groupPolicy` value caused OpenClaw config validation to reject the entire file. This broke dreaming, memory-core, and all plugins.
+3. **Invalid JSON written** — malformed JSON crashed the gateway entirely.
+
+Each time required the operator to redeploy the container to recover.
+
+**Rules when editing openclaw.json:**
+- NEVER change `gateway.auth.token` — it must match the Worker
+- NEVER add channel configs with unknown or invalid property values — OpenClaw has strict validation. Valid channel policy values are: "open", "disabled", "allowlist"
+- Always validate your JSON is well-formed before writing
+- Keep a mental note of what the working config looked like before changing it
+- If unsure about a config property, don't add it — ask the operator
+
+## Channels
+
+- **Google Chat** is configured in the entrypoint config. The channel config at `channels.googlechat` is managed by the operator. Do not modify `audienceType`, `audience`, `webhookPath`, `serviceAccountFile`, or `dm.policy`. You may add users to `dm.allowFrom` or configure spaces under `groups` — but use only valid values: groupPolicy must be "open", "disabled", or "allowlist".
+
+## Environment
+
+- Cloudflare Container behind a Worker proxy on port 6658
+- Browser automation via Cloudflare Browser Rendering CDP proxy
+- Embedding/memory provider is `gemini` — there is no OpenAI API key
+- State backed up to R2 periodically (workspace, credentials, agents dirs)
+- Container may be recycled — the entrypoint rewrites openclaw.json on every boot from a template, so runtime config changes are lost on restart
+EOFMEMORY
+echo "[INFO] MEMORY.md seeded in workspace"
+fi
+
+# Configure Google Chat channel (bundled plugin auto-activates from channel config)
+if [ -f "$STATE_DIR/googlechat-sa.json" ]; then
+	node -e "
+const fs = require('fs');
+const f = '$OPENCLAW_STATE_DIR/openclaw.json';
+const c = JSON.parse(fs.readFileSync(f, 'utf8'));
+c.channels = c.channels || {};
+c.channels.googlechat = {
+  enabled: true,
+  serviceAccountFile: '$STATE_DIR/googlechat-sa.json',
+  audienceType: 'app-url',
+  audience: 'https://cloud-claw.quickpointme.workers.dev/googlechat',
+  webhookPath: '/googlechat',
+  dm: { policy: 'disabled' },
+  groupPolicy: 'allowlist'
+};
+fs.writeFileSync(f, JSON.stringify(c, null, 2));
+console.log('[INFO] Google Chat channel configured');
+"
 fi
 
 echo "[INFO] Starting OpenClaw Gateway..."
@@ -159,6 +293,8 @@ openclaw gateway --port 6658 --bind lan --allow-unconfigured &
 OPENCLAW_PID=$!
 wait $OPENCLAW_PID
 EOF
+
+LABEL cloud-claw.version="v2-no-operator-ws"
 
 WORKDIR /data/workspace
 EXPOSE 6658
