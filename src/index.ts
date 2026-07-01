@@ -44,6 +44,11 @@ async function handleFetch(request: Request) {
     return proxyCdp(env.BROWSER, request, `${url.protocol}//${host}`, token)
   }
 
+  // /googlechat — Google Chat webhooks use their own bearer auth
+  if (url.pathname.startsWith('/googlechat')) {
+    return forwardRequestToContainer(request)
+  }
+
   // All other paths use Basic Auth
   const authError = verifyBasicAuth(request)
   if (authError) {
@@ -52,6 +57,12 @@ async function handleFetch(request: Request) {
   return forwardRequestToContainer(request)
 }
 
+async function handleScheduled() {
+  await forwardRequestToContainer(new Request('http://container/health'))
+  console.info('[cron] container wake-up ping sent')
+}
+
 export default {
   fetch: handleFetch,
+  scheduled: handleScheduled,
 } satisfies ExportedHandler<Cloudflare.Env>

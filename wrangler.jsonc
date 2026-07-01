@@ -46,6 +46,12 @@
       },
     ],
   },
+  // Wake container at 8am Irish time (7am UTC year-round close enough;
+  // IST is UTC+1 in summer so this fires at 8am in winter, 8am in summer
+  // only if we use Europe/Dublin — but cron uses UTC, so 7am UTC = 8am IST)
+  "triggers": {
+    "crons": ["0 7 * * *"],
+  },
   "migrations": [
     {
       "new_sqlite_classes": ["AgentContainer"],
