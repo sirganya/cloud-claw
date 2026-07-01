@@ -277,7 +277,7 @@ c.channels.googlechat = {
   audienceType: 'app-url',
   audience: 'https://cloud-claw.quickpointme.workers.dev/googlechat',
   webhookPath: '/googlechat',
-  appPrincipal: '108258415507025781691',
+  appPrincipal: '103119841339856136234',
   dm: { policy: 'disabled' },
   groupPolicy: 'allowlist'
 };
