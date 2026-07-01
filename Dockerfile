@@ -264,27 +264,55 @@ EOFMEMORY
 echo "[INFO] MEMORY.md seeded in workspace"
 fi
 
-# Configure Google Chat channel (bundled plugin auto-activates from channel config)
-if [ -f "$STATE_DIR/googlechat-sa.json" ]; then
-	node -e "
+# Patch config with channels, plugins, and session settings
+node -e "
 const fs = require('fs');
 const f = '$OPENCLAW_STATE_DIR/openclaw.json';
 const c = JSON.parse(fs.readFileSync(f, 'utf8'));
+
 c.channels = c.channels || {};
-c.channels.googlechat = {
-  enabled: true,
-  serviceAccountFile: '$STATE_DIR/googlechat-sa.json',
-  audienceType: 'app-url',
-  audience: 'https://cloud-claw.quickpointme.workers.dev/googlechat',
-  webhookPath: '/googlechat',
-  appPrincipal: '103119841339856136234',
-  dm: { policy: 'disabled' },
-  groupPolicy: 'allowlist'
-};
+
+// Google Chat (if service account is available)
+if (fs.existsSync('$STATE_DIR/googlechat-sa.json')) {
+  c.channels.googlechat = {
+    enabled: true,
+    name: 'Quickly',
+    serviceAccountFile: '$STATE_DIR/googlechat-sa.json',
+    audienceType: 'app-url',
+    audience: '${WORKER_URL}/googlechat',
+    webhookPath: '/googlechat',
+    appPrincipal: '103119841339856136234',
+    dm: { policy: 'open', enabled: true, allowFrom: ['*'] },
+    groupPolicy: 'open',
+    groupAllowFrom: [],
+    typingIndicator: 'message',
+    groups: { 'spaces/AAQAdFhXWNQ': { enabled: true } }
+  };
+  console.log('[INFO] Google Chat channel configured');
+}
+
+// Telegram (if bot token is available)
+if (process.env.TELEGRAM_BOT_TOKEN) {
+  c.channels.telegram = {
+    enabled: true,
+    name: 'Quickly',
+    botToken: process.env.TELEGRAM_BOT_TOKEN,
+    dmPolicy: 'open',
+    groupPolicy: 'open',
+    allowFrom: ['*'],
+    groupAllowFrom: ['*']
+  };
+  console.log('[INFO] Telegram channel configured');
+}
+
+// Plugins
+c.plugins = { entries: { google: { enabled: true }, browser: { enabled: true } } };
+
+// Session
+c.session = { dmScope: 'per-channel-peer' };
+
 fs.writeFileSync(f, JSON.stringify(c, null, 2));
-console.log('[INFO] Google Chat channel configured');
 "
-fi
 
 echo "[INFO] Starting OpenClaw Gateway..."
 echo "[INFO] Visit Web UI for initial setup on first use"
