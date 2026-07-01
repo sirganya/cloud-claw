@@ -202,11 +202,11 @@ cat > "$OPENCLAW_STATE_DIR/openclaw.json" << EOFCONFIG
     "defaults": {
       "model": {
         "primary": "google/gemini-3.5-flash"
+      },
+      "memorySearch": {
+        "enabled": true
       }
     }
-  },
-  "memorySearch": {
-    "provider": "gemini"
   },
   "browser": {
     "enabled": true,
