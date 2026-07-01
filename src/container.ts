@@ -16,70 +16,30 @@ export class AgentContainer extends Container {
     PORT: PORT.toString(),
   }
 
-  async watchContainer() {
-    try {
-      const res = await this.containerFetch('http://container/', {
-        headers: { Upgrade: 'websocket' },
-      })
-
-      if (res.webSocket === null) {
-        throw new Error('WebSocket server error')
-      }
-
-      const ws = res.webSocket
-
-      ws.addEventListener('message', (msg) => {
-        try {
-          const frame = JSON.parse(msg.data as string)
-
-          // Keep-alive only on chat events with state 'final'
-          if (frame.event === 'chat' && frame.payload?.state === 'final') {
-            console.info('Keep-alive: chat final event')
-            this.renewActivityTimeout()
-          }
-
-          if (frame.type === 'res' && frame.id === '1') {
-            console.info(frame.ok ? 'Gateway connected' : 'Gateway connection failed')
-          }
-        } catch {
-          console.info('Error parsing WebSocket message')
-        }
-      })
-
-      ws.addEventListener('close', () => {
-        console.warn('WebSocket closed, reconnecting in 30s...')
-        setTimeout(() => {
-          this.watchContainer()
-        }, 30_000)
-      })
-
-      ws.accept()
-
-      const token = env.OPENCLAW_GATEWAY_TOKEN
-      ws.send(
-        JSON.stringify({
-          type: 'req',
-          id: '1',
-          method: 'connect',
-          params: {
-            minProtocol: 3,
-            maxProtocol: 3,
-            client: { id: 'cli', version: '1.0.0', platform: 'cloudflare', mode: 'cli' },
-            role: 'operator',
-            scopes: ['operator.read'],
-            auth: token ? { token } : undefined,
-          },
-        }),
-      )
-    } catch (error) {
-      console.error('WebSocket connection failed:', error)
-    }
-  }
-
   override async onStart(): Promise<void> {
-    if (this.sleepAfter !== 'never') {
-      await this.watchContainer()
-    }
+    console.info('[container] onStart v2 — no operator WebSocket')
+
+    setInterval(async () => {
+      const now = new Date()
+      const irish = new Intl.DateTimeFormat('en-IE', {
+        timeZone: 'Europe/Dublin',
+        hour: 'numeric',
+        hour12: false,
+      }).format(now)
+      const hour = parseInt(irish, 10)
+      const isBusinessHours = hour >= 8 && hour < 20
+
+      if (!isBusinessHours) return
+
+      try {
+        const res = await this.containerFetch('http://container/health')
+        if (res.ok) {
+          this.renewActivityTimeout()
+        }
+      } catch {
+        console.warn('[container] health check failed — gateway not ready')
+      }
+    }, 5 * 60_000)
   }
 }
 
