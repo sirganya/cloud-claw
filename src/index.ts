@@ -44,6 +44,19 @@ async function handleFetch(request: Request) {
     return proxyCdp(env.BROWSER, request, `${url.protocol}//${host}`, token)
   }
 
+  // /restart/{token} — force container restart
+  const restartMatch = url.pathname.match(/^\/restart\/([^/]+)/)
+  if (restartMatch) {
+    const [, token] = restartMatch
+    if (!env.OPENCLAW_GATEWAY_TOKEN || token !== env.OPENCLAW_GATEWAY_TOKEN) {
+      return new Response('Unauthorized', { status: 401 })
+    }
+    const objectId = env.AGENT_CONTAINER.idFromName('cf-singleton-container')
+    const stub = env.AGENT_CONTAINER.get(objectId, { locationHint: 'wnam' })
+    await stub.destroy()
+    return new Response('Container restart triggered', { status: 200 })
+  }
+
   // /googlechat — Google Chat webhooks use their own bearer auth
   if (url.pathname.startsWith('/googlechat')) {
     return forwardRequestToContainer(request)

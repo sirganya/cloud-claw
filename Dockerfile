@@ -141,12 +141,32 @@ backup_to_r2() {
 	done
 }
 
+fuse_watchdog() {
+	while true; do
+		sleep 60
+		if [ "$R2_AVAILABLE" != "true" ]; then continue; fi
+		# Test FUSE mount with a timeout — if stat hangs, the mount is dead
+		if ! timeout 10 stat "$R2_MOUNT" >/dev/null 2>&1; then
+			echo "[WARN] FUSE mount hung, remounting..."
+			fusermount -u "$R2_MOUNT" 2>/dev/null || true
+			sleep 2
+			if mount_r2; then
+				echo "[OK] FUSE remounted successfully"
+			else
+				echo "[ERROR] FUSE remount failed"
+				R2_AVAILABLE=false
+			fi
+		fi
+	done
+}
+
 R2_AVAILABLE=false
 if mount_r2; then
 	R2_AVAILABLE=true
 	restore_from_r2
 	backup_to_r2 &
 	BACKUP_PID=$!
+	fuse_watchdog &
 fi
 
 cleanup() {
@@ -329,7 +349,7 @@ LABEL cloud-claw.version="v2-no-operator-ws"
 WORKDIR /data/workspace
 EXPOSE 6658
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-	CMD curl -f http://localhost:6658/health || exit 1
+HEALTHCHECK --interval=30s --timeout=15s --start-period=60s --retries=3 \
+	CMD curl -f http://localhost:6658/health && timeout 5 stat /data >/dev/null 2>&1 || exit 1
 
 ENTRYPOINT ["/entrypoint.sh"]
