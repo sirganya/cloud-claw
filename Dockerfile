@@ -81,8 +81,9 @@ STATE_DIR="/data"
 export OPENCLAW_STATE_DIR="$STATE_DIR"
 export OPENCLAW_WORKSPACE_DIR="$STATE_DIR/workspace"
 export OPENCLAW_SKIP_FS_PERMISSION_CHECK=1
+export GOG_HOME="$STATE_DIR/gog"
 
-mkdir -p "$STATE_DIR" "$STATE_DIR/workspace"
+mkdir -p "$STATE_DIR" "$STATE_DIR/workspace" "$STATE_DIR/gog"
 
 mount_r2() {
 	mountpoint -q "$R2_MOUNT" 2>/dev/null && fusermount -u "$R2_MOUNT" 2>/dev/null || true
@@ -118,7 +119,7 @@ mount_r2() {
 
 restore_from_r2() {
 	echo "[INFO] Restoring state from R2..."
-	for dir in credentials workspace agents; do
+	for dir in credentials workspace agents gog; do
 		if [ -d "$R2_MOUNT/$dir" ]; then
 			mkdir -p "$STATE_DIR/$dir"
 			rsync -a --exclude='openclaw.json' --exclude='openclaw.json.bak' "$R2_MOUNT/$dir/" "$STATE_DIR/$dir/" 2>/dev/null || true
@@ -131,7 +132,7 @@ backup_to_r2() {
 	while true; do
 		sleep 300
 		if mountpoint -q "$R2_MOUNT" 2>/dev/null; then
-			for dir in workspace credentials agents; do
+			for dir in workspace credentials agents gog; do
 				if [ -d "$STATE_DIR/$dir" ]; then
 					rsync -a --delete "$STATE_DIR/$dir/" "$R2_MOUNT/$dir/" 2>/dev/null || true
 				fi
@@ -153,7 +154,7 @@ cleanup() {
 	# Final backup
 	if [ "$R2_AVAILABLE" = "true" ] && mountpoint -q "$R2_MOUNT" 2>/dev/null; then
 		echo "[INFO] Final backup to R2..."
-		for dir in workspace credentials agents; do
+		for dir in workspace credentials agents gog; do
 			[ -d "$STATE_DIR/$dir" ] && rsync -a --delete "$STATE_DIR/$dir/" "$R2_MOUNT/$dir/" 2>/dev/null || true
 		done
 	fi
