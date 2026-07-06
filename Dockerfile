@@ -310,7 +310,6 @@ if (fs.existsSync('$STATE_DIR/googlechat-sa.json')) {
     webhookPath: '/googlechat',
     appPrincipal: '103119841339856136234',
     botUser: 'users/103119841339856136234',
-    replyToMode: 'all',
     dm: { policy: 'open', enabled: true, allowFrom: ['*'] },
     groupPolicy: 'open',
     groupAllowFrom: ['*'],
