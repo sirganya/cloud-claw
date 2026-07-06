@@ -65,8 +65,7 @@ RUN sed -i 's/if (process.platform === "win32") return;/if (process.platform ===
 # Patch: deterministic session revision to fix "reply session initialization conflicted" (#key-ordering)
 RUN sed -i 's/function createReplySessionInitializationRevision(entry) {/function _canonicalize(v){if(v===null||typeof v!=="object")return v;if(Array.isArray(v))return v.map(_canonicalize);var r={};Object.keys(v).sort().forEach(function(k){if(v[k]!==undefined)r[k]=_canonicalize(v[k])});return r}function createReplySessionInitializationRevision(entry) {/' /openclaw/dist/session-accessor-*.js
 RUN sed -i 's/return JSON.stringify(entry ?? null);/return JSON.stringify(_canonicalize(entry ?? null));/' /openclaw/dist/session-accessor-*.js
-# Patch: derive thread name from message.name when thread.name is absent (fixes space reply threading)
-RUN node -e "const fs=require('fs'),d='/openclaw/dist',old='const replyThreadName = isGroup ? message.thread?.name : void 0;',neo='let threadName=message.thread?.name;if(isGroup&&!threadName&&message.name){threadName=message.name.replace(\"/messages/\",\"/threads/\").split(\".\")[0];}const replyThreadName=isGroup?threadName:void 0;';fs.readdirSync(d).filter(f=>/^channel\\.runtime-.*\\.js\$/.test(f)).forEach(f=>{const p=d+'/'+f,s=fs.readFileSync(p,'utf8');if(s.includes(old))fs.writeFileSync(p,s.replace(old,neo));})"
+
 COPY openclaw-build/dist-runtime/ /openclaw/dist-runtime/
 
 RUN printf '%s\n' '#!/usr/bin/env bash' 'exec node /openclaw/dist/index.js "$@"' > /usr/local/bin/openclaw \
