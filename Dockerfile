@@ -46,13 +46,12 @@ COPY openclaw-build/node_modules/@pierre /openclaw/node_modules/@pierre
 # Layer 4: everything else
 COPY openclaw-build/node_modules /openclaw/node_modules
 
-# Source and config files
+# Config and package files
 COPY openclaw-build/extensions /openclaw/extensions
 COPY openclaw-build/package.json /openclaw/package.json
 COPY openclaw-build/pnpm-workspace.yaml /openclaw/pnpm-workspace.yaml
 COPY openclaw-build/openclaw.mjs /openclaw/openclaw.mjs
 COPY openclaw-build/packages /openclaw/packages
-COPY openclaw-build/src /openclaw/src
 
 # Pre-built dist artifacts (overlay last so they win)
 COPY openclaw-build/dist/ /openclaw/dist/
@@ -62,6 +61,10 @@ COPY openclaw-build/docs/reference/templates/ /openclaw/src/agents/templates/
 
 # Patch: skip secret-dir permission check on FUSE mounts (TigrisFS ignores chmod)
 RUN sed -i 's/if (process.platform === "win32") return;/if (process.platform === "win32" || process.env.OPENCLAW_SKIP_FS_PERMISSION_CHECK === "1") return;/' /openclaw/dist/secret-file-*.js
+
+# Patch: deterministic session revision to fix "reply session initialization conflicted" (#key-ordering)
+RUN sed -i 's/function createReplySessionInitializationRevision(entry) {/function _canonicalize(v){if(v===null||typeof v!=="object")return v;if(Array.isArray(v))return v.map(_canonicalize);var r={};Object.keys(v).sort().forEach(function(k){if(v[k]!==undefined)r[k]=_canonicalize(v[k])});return r}function createReplySessionInitializationRevision(entry) {/' /openclaw/dist/session-accessor-*.js
+RUN sed -i 's/return JSON.stringify(entry ?? null);/return JSON.stringify(_canonicalize(entry ?? null));/' /openclaw/dist/session-accessor-*.js
 COPY openclaw-build/dist-runtime/ /openclaw/dist-runtime/
 
 RUN printf '%s\n' '#!/usr/bin/env bash' 'exec node /openclaw/dist/index.js "$@"' > /usr/local/bin/openclaw \
@@ -304,11 +307,12 @@ if (fs.existsSync('$STATE_DIR/googlechat-sa.json')) {
     audience: '${WORKER_URL}/googlechat',
     webhookPath: '/googlechat',
     appPrincipal: '103119841339856136234',
+    botUser: 'users/103119841339856136234',
     dm: { policy: 'open', enabled: true, allowFrom: ['*'] },
     groupPolicy: 'open',
-    groupAllowFrom: [],
+    groupAllowFrom: ['*'],
     typingIndicator: 'message',
-    groups: { 'spaces/AAQAdFhXWNQ': { enabled: true } }
+    groups: { 'spaces/AAQAdFhXWNQ': { enabled: true, requireMention: false } }
   };
   console.log('[INFO] Google Chat channel configured');
 }
@@ -328,7 +332,23 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
 }
 
 // Plugins
-c.plugins = { entries: { google: { enabled: true }, browser: { enabled: true } } };
+c.plugins = {
+  entries: {
+    google: { enabled: true },
+    browser: { enabled: true },
+    googlechat: { enabled: true },
+    telegram: { enabled: true },
+    'memory-core': {
+      enabled: true,
+      config: {
+        dreaming: {
+          enabled: true,
+          timezone: 'UTC',
+        },
+      },
+    },
+  },
+};
 
 // Session
 c.session = { dmScope: 'per-channel-peer' };
