@@ -314,7 +314,7 @@ if (fs.existsSync('$STATE_DIR/googlechat-sa.json')) {
     dm: { policy: 'open', enabled: true, allowFrom: ['*'] },
     groupPolicy: 'open',
     groupAllowFrom: ['*'],
-    typingIndicator: 'message',
+    typingIndicator: 'none',
     groups: { 'spaces/AAQAdFhXWNQ': { enabled: true, requireMention: false } }
   };
   console.log('[INFO] Google Chat channel configured');
