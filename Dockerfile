@@ -66,6 +66,32 @@ RUN sed -i 's/if (process.platform === "win32") return;/if (process.platform ===
 RUN sed -i 's/function createReplySessionInitializationRevision(entry) {/function _canonicalize(v){if(v===null||typeof v!=="object")return v;if(Array.isArray(v))return v.map(_canonicalize);var r={};Object.keys(v).sort().forEach(function(k){if(v[k]!==undefined)r[k]=_canonicalize(v[k])});return r}function createReplySessionInitializationRevision(entry) {/' /openclaw/dist/session-accessor-*.js
 RUN sed -i 's/return JSON.stringify(entry ?? null);/return JSON.stringify(_canonicalize(entry ?? null));/' /openclaw/dist/session-accessor-*.js
 
+# Patch: fix Google Chat space thread replies (OpenClaw normalizes replyToId to lowercase,
+# making the Google Chat thread resource name invalid). Both deliver and durable closures
+# already have replyThreadName in scope (captured from the raw API event before normalization).
+RUN python3 -c "
+import glob, re
+
+for f in glob.glob('/openclaw/dist/channel.runtime-*.js'):
+    t = open(f).read()
+    orig = t
+    # Override replyToId with closure-scoped replyThreadName in the durable reply handler
+    t = re.sub(
+        r'(resolveGoogleChatDurableReplyOptions\(\{)[^\n]*\n(\s*)payload,',
+        lambda m: m.group(1) + '\n' + m.group(2) + 'payload: { ...payload, replyToId: replyThreadName ?? payload.replyToId },',
+        t
+    )
+    # Override replyToId with closure-scoped replyThreadName in the deliver handler
+    t = re.sub(
+        r'(await deliverGoogleChatReply\(\{)[^\n]*\n(\s*)payload,',
+        lambda m: m.group(1) + '\n' + m.group(2) + 'payload: { ...payload, replyToId: replyThreadName ?? payload.replyToId },',
+        t
+    )
+    if t != orig:
+        open(f, 'w').write(t)
+        print('Patched', f)
+"
+
 COPY openclaw-build/dist-runtime/ /openclaw/dist-runtime/
 
 RUN printf '%s\n' '#!/usr/bin/env bash' 'exec node /openclaw/dist/index.js "$@"' > /usr/local/bin/openclaw \
@@ -151,8 +177,11 @@ fuse_watchdog() {
 		if [ "$R2_AVAILABLE" != "true" ]; then continue; fi
 		# Test FUSE mount with a timeout — if stat hangs, the mount is dead
 		if ! timeout 10 stat "$R2_MOUNT" >/dev/null 2>&1; then
-			echo "[WARN] FUSE mount hung, remounting..."
-			fusermount -u "$R2_MOUNT" 2>/dev/null || true
+			echo "[WARN] FUSE mount hung, force-unmounting..."
+			# umount -l (lazy) detaches immediately even if FUSE is deadlocked;
+			# fusermount -u hangs on a deadlocked mount and makes things worse
+			umount -l "$R2_MOUNT" 2>/dev/null || true
+			killall -9 tigrisfs 2>/dev/null || true
 			sleep 2
 			if mount_r2; then
 				echo "[OK] FUSE remounted successfully"
@@ -187,7 +216,7 @@ cleanup() {
 		kill -TERM "$OPENCLAW_PID" 2>/dev/null
 		wait "$OPENCLAW_PID" 2>/dev/null
 	fi
-	mountpoint -q "$R2_MOUNT" 2>/dev/null && fusermount -u "$R2_MOUNT" 2>/dev/null || true
+	mountpoint -q "$R2_MOUNT" 2>/dev/null && umount -l "$R2_MOUNT" 2>/dev/null || true
 	exit 0
 }
 trap cleanup SIGTERM SIGINT
