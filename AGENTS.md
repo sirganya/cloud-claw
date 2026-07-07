@@ -167,3 +167,137 @@ const res = await browser.fetch('http://cloudflare.browser/v1/acquire')
 **CDP proxy:** Edit `src/cdp.ts` — chunked binary WebSocket framing between client and Browser binding
 
 **Handler pattern:** `export default { fetch: handleFetch } satisfies ExportedHandler<Cloudflare.Env>`
+
+---
+
+## OpenClaw Config
+
+### Config is rewritten on every boot
+
+`entrypoint.sh` writes `/data/openclaw.json` from a template on every container
+start. Any runtime edits to that file are lost on redeploy or restart. All
+config changes must go in the **Dockerfile**.
+
+The entrypoint has two config phases:
+1. A `cat > openclaw.json` heredoc for the base structure (gateway, agents defaults, browser)
+2. A `node -e "..."` block that patches channels, plugins, and session settings
+
+Channel-specific config (googlechat, telegram, etc.) belongs in the node block.
+
+### Google Chat channel config
+
+Working config as of 2026-07:
+
+```javascript
+c.channels.googlechat = {
+  enabled: true,
+  name: 'Quickly',
+  serviceAccountFile: '$STATE_DIR/googlechat-sa.json',
+  audienceType: 'app-url',
+  audience: '${WORKER_URL}/googlechat',
+  webhookPath: '/googlechat',
+  appPrincipal: '103119841339856136234',
+  botUser: 'users/103119841339856136234',   // required for @mention detection
+  dm: { policy: 'open', enabled: true, allowFrom: ['*'] },
+  groupPolicy: 'open',
+  groupAllowFrom: ['*'],                     // must be ['*'], empty array silently drops all messages
+  replyToMode: 'all',                        // 'off' (default) strips thread ID → new thread each reply
+  typingIndicator: 'none',                   // 'message' mode posts placeholder in wrong thread
+  groups: { 'spaces/AAQAdFhXWNQ': { enabled: true, requireMention: false } }
+};
+```
+
+#### Settings that matter
+
+**`botUser`** — required for @mention detection. Value is `users/<appPrincipal>`.
+Without it the bot receives space messages but cannot detect mentions.
+
+**`groupAllowFrom`** — must be `['*']`. An empty array or missing field silently
+drops all inbound space messages (no error, no log).
+
+**`replyToMode`** — controls threading of bot replies. Valid values (confirmed in
+OpenClaw source `extensions/googlechat/src/channel.adapters.ts`):
+- `'off'` (default) — strips thread ID; every bot reply creates a new top-level thread
+- `'all'` — bot replies in the same thread as the triggering message
+- `'first'` — only threads the first reply
+
+Use `'all'` for normal conversational behaviour in a space.
+
+**`typingIndicator`** — `'message'` posts a "…is typing" placeholder then edits it
+with the actual reply. When posted without a valid thread context it lands in a
+new thread, pulling the reply out of the conversation. Set to `'none'`.
+
+**`groups`** keys must be the exact space resource name from Google Chat
+(`spaces/AAQAdFhXWNQ`). Case-sensitive in config.
+
+**`groupPolicy`** valid values: `"open"`, `"disabled"`, `"allowlist"`. OpenClaw
+validates this strictly — an invalid value breaks the entire config on load.
+
+#### replyToId lowercasing bug (Dockerfile patch)
+
+OpenClaw normalises channel peer IDs to lowercase for session key routing. This
+normalisation was also applied to `replyToId` (the Google Chat thread resource
+name), making API calls fail with:
+
+```
+Google Chat API 400: The request contains an invalid thread resource name
+```
+
+Google Chat thread names are case-sensitive (`spaces/AAQAdFhXWNQ/threads/X`
+is valid; `spaces/aaqadfhxwnq/threads/X` is not).
+
+**Fix in Dockerfile**: a `sed` patch overrides `payload.replyToId` with
+`replyThreadName` at the deliver and durable call sites in
+`dist/channel.runtime-*.js`. `replyThreadName` is captured from the raw API
+event before normalisation and is in scope as a closure variable at both call
+sites. Do not remove these sed lines.
+
+### Dockerfile patching rules
+
+OpenClaw ships pre-built dist files. Permanent fixes go as `RUN sed -i ...`
+after `COPY openclaw-build/dist/`.
+
+- Use **single-line** `sed` commands only. Multiline `python3 -c "..."` blocks
+  fail — Docker treats each unescaped newline in a `RUN` as a new instruction.
+- Use `sed` address + `{n; s/.../}` to match a line and substitute the next line.
+- Glob patterns (`dist/channel.runtime-*.js`) are fine; sed silently skips
+  files where the pattern does not match.
+- `??` (nullish coalescing) is safe in sed replacement strings.
+
+Current patches:
+
+| File glob | What | Why |
+|---|---|---|
+| `dist/secret-file-*.js` | Skip FS permission check | TigrisFS FUSE ignores chmod |
+| `dist/session-accessor-*.js` | Deterministic JSON serialisation | Prevents "reply session initialization conflicted" |
+| `dist/channel.runtime-*.js` | Restore original-case replyToId | OpenClaw lowercases it; Google Chat API rejects lowercase thread names |
+
+### FUSE / TigrisFS
+
+TigrisFS mounts R2 at `/r2` for backup. FUSE can deadlock, putting any process
+touching `/r2` into uninterruptible D-state (blocking SSH and other operations).
+
+To unmount a deadlocked FUSE mount:
+```bash
+umount -l /r2       # lazy unmount — detaches immediately even when deadlocked
+killall -9 tigrisfs # kill driver so it can be restarted cleanly
+```
+
+Do **not** use `fusermount -u` on a deadlocked mount — it hangs indefinitely.
+
+The `fuse_watchdog` loop in `entrypoint.sh` checks every 60 s with a 10 s
+timeout and runs the above automatically on deadlock.
+
+State lives on local disk (`/data`). R2 is backup only — a FUSE deadlock does
+not lose data, it only blocks backup syncs until remount.
+
+### SSH into the container
+
+```bash
+wrangler containers instances <APP_ID>   # get instance ID
+wrangler containers ssh <INSTANCE_ID>
+```
+
+The SSH key is declared in `wrangler.jsonc` under `authorized_keys`. If SSH
+fails with permission denied after a fresh deploy, wait for the container to
+fully start and retry.
