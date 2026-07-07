@@ -223,9 +223,11 @@ OpenClaw source `extensions/googlechat/src/channel.adapters.ts`):
 
 Use `'all'` for normal conversational behaviour in a space.
 
-**`typingIndicator`** — `'message'` posts a "…is typing" placeholder then edits it
-with the actual reply. When posted without a valid thread context it lands in a
-new thread, pulling the reply out of the conversation. Set to `'none'`.
+**`typingIndicator`** — `'message'` (default) posts a "…is typing" placeholder
+using `replyThreadName` directly from the raw webhook event (correctly cased),
+then **edits** it with the actual reply. This keeps everything in the correct
+thread without touching `payload.replyToId` at all for text replies. Leave at
+the default unless there is a specific reason to disable it.
 
 **`groups`** keys must be the exact space resource name from Google Chat
 (`spaces/AAQAdFhXWNQ`). Case-sensitive in config.
@@ -233,36 +235,16 @@ new thread, pulling the reply out of the conversation. Set to `'none'`.
 **`groupPolicy`** valid values: `"open"`, `"disabled"`, `"allowlist"`. OpenClaw
 validates this strictly — an invalid value breaks the entire config on load.
 
-#### replyToId lowercasing bug (Dockerfile patch)
-
-OpenClaw normalises channel peer IDs to lowercase for session key routing. This
-normalisation was also applied to `replyToId` (the Google Chat thread resource
-name), making API calls fail with:
-
-```
-Google Chat API 400: The request contains an invalid thread resource name
-```
-
-Google Chat thread names are case-sensitive (`spaces/AAQAdFhXWNQ/threads/X`
-is valid; `spaces/aaqadfhxwnq/threads/X` is not).
-
-**Fix in Dockerfile**: a `sed` patch overrides `payload.replyToId` with
-`replyThreadName` at the deliver and durable call sites in
-`dist/channel.runtime-*.js`. `replyThreadName` is captured from the raw API
-event before normalisation and is in scope as a closure variable at both call
-sites. Do not remove these sed lines.
-
 ### Dockerfile patching rules
 
-OpenClaw ships pre-built dist files. Permanent fixes go as `RUN sed -i ...`
-after `COPY openclaw-build/dist/`.
+OpenClaw ships pre-built dist files. The two existing patches are load-bearing
+and must not be removed.
 
 - Use **single-line** `sed` commands only. Multiline `python3 -c "..."` blocks
   fail — Docker treats each unescaped newline in a `RUN` as a new instruction.
 - Use `sed` address + `{n; s/.../}` to match a line and substitute the next line.
-- Glob patterns (`dist/channel.runtime-*.js`) are fine; sed silently skips
+- Glob patterns (`dist/session-accessor-*.js`) are fine; sed silently skips
   files where the pattern does not match.
-- `??` (nullish coalescing) is safe in sed replacement strings.
 
 Current patches:
 
@@ -270,7 +252,10 @@ Current patches:
 |---|---|---|
 | `dist/secret-file-*.js` | Skip FS permission check | TigrisFS FUSE ignores chmod |
 | `dist/session-accessor-*.js` | Deterministic JSON serialisation | Prevents "reply session initialization conflicted" |
-| `dist/channel.runtime-*.js` | Restore original-case replyToId | OpenClaw lowercases it; Google Chat API rejects lowercase thread names |
+
+**Do not patch dist files for Google Chat threading issues** — use the correct
+config (`typingIndicator: "message"`, `replyToMode: "all"`) instead. The plugin
+is well-tested and handles threading correctly with the right config.
 
 ### FUSE / TigrisFS
 
