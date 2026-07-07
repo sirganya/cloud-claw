@@ -323,6 +323,7 @@ if (fs.existsSync('$STATE_DIR/googlechat-sa.json')) {
     dm: { policy: 'open', enabled: true, allowFrom: ['*'] },
     groupPolicy: 'open',
     groupAllowFrom: ['*'],
+    replyToMode: 'all',
     typingIndicator: 'none',
     groups: { 'spaces/AAQAdFhXWNQ': { enabled: true, requireMention: false } }
   };
