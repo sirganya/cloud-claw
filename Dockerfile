@@ -69,28 +69,10 @@ RUN sed -i 's/return JSON.stringify(entry ?? null);/return JSON.stringify(_canon
 # Patch: fix Google Chat space thread replies (OpenClaw normalizes replyToId to lowercase,
 # making the Google Chat thread resource name invalid). Both deliver and durable closures
 # already have replyThreadName in scope (captured from the raw API event before normalization).
-RUN python3 -c "
-import glob, re
-
-for f in glob.glob('/openclaw/dist/channel.runtime-*.js'):
-    t = open(f).read()
-    orig = t
-    # Override replyToId with closure-scoped replyThreadName in the durable reply handler
-    t = re.sub(
-        r'(resolveGoogleChatDurableReplyOptions\(\{)[^\n]*\n(\s*)payload,',
-        lambda m: m.group(1) + '\n' + m.group(2) + 'payload: { ...payload, replyToId: replyThreadName ?? payload.replyToId },',
-        t
-    )
-    # Override replyToId with closure-scoped replyThreadName in the deliver handler
-    t = re.sub(
-        r'(await deliverGoogleChatReply\(\{)[^\n]*\n(\s*)payload,',
-        lambda m: m.group(1) + '\n' + m.group(2) + 'payload: { ...payload, replyToId: replyThreadName ?? payload.replyToId },',
-        t
-    )
-    if t != orig:
-        open(f, 'w').write(t)
-        print('Patched', f)
-"
+# sed: on lines matching the function call, advance to the next line and replace plain `payload,`
+# with a spread that overrides replyToId with the correctly-cased replyThreadName from the closure.
+RUN sed -i '/resolveGoogleChatDurableReplyOptions(/{n;s/^\(\s*\)payload,$/\1payload: { ...payload, replyToId: replyThreadName ?? payload.replyToId },/}' /openclaw/dist/channel.runtime-*.js \
+ && sed -i '/await deliverGoogleChatReply(/{n;s/^\(\s*\)payload,$/\1payload: { ...payload, replyToId: replyThreadName ?? payload.replyToId },/}' /openclaw/dist/channel.runtime-*.js
 
 COPY openclaw-build/dist-runtime/ /openclaw/dist-runtime/
 
