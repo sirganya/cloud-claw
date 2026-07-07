@@ -66,13 +66,6 @@ RUN sed -i 's/if (process.platform === "win32") return;/if (process.platform ===
 RUN sed -i 's/function createReplySessionInitializationRevision(entry) {/function _canonicalize(v){if(v===null||typeof v!=="object")return v;if(Array.isArray(v))return v.map(_canonicalize);var r={};Object.keys(v).sort().forEach(function(k){if(v[k]!==undefined)r[k]=_canonicalize(v[k])});return r}function createReplySessionInitializationRevision(entry) {/' /openclaw/dist/session-accessor-*.js
 RUN sed -i 's/return JSON.stringify(entry ?? null);/return JSON.stringify(_canonicalize(entry ?? null));/' /openclaw/dist/session-accessor-*.js
 
-# Patch: fix Google Chat space thread replies (OpenClaw normalizes replyToId to lowercase,
-# making the Google Chat thread resource name invalid). Both deliver and durable closures
-# already have replyThreadName in scope (captured from the raw API event before normalization).
-# sed: on lines matching the function call, advance to the next line and replace plain `payload,`
-# with a spread that overrides replyToId with the correctly-cased replyThreadName from the closure.
-RUN sed -i '/resolveGoogleChatDurableReplyOptions(/{n;s/^\(\s*\)payload,$/\1payload: { ...payload, replyToId: replyThreadName ?? payload.replyToId },/}' /openclaw/dist/channel.runtime-*.js \
- && sed -i '/await deliverGoogleChatReply(/{n;s/^\(\s*\)payload,$/\1payload: { ...payload, replyToId: replyThreadName ?? payload.replyToId },/}' /openclaw/dist/channel.runtime-*.js
 
 COPY openclaw-build/dist-runtime/ /openclaw/dist-runtime/
 
@@ -324,7 +317,6 @@ if (fs.existsSync('$STATE_DIR/googlechat-sa.json')) {
     groupPolicy: 'open',
     groupAllowFrom: ['*'],
     replyToMode: 'all',
-    typingIndicator: 'none',
     groups: { 'spaces/AAQAdFhXWNQ': { enabled: true, requireMention: false } }
   };
   console.log('[INFO] Google Chat channel configured');
