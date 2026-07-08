@@ -179,6 +179,7 @@ start. Any runtime edits to that file are lost on redeploy or restart. All
 config changes must go in the **Dockerfile**.
 
 The entrypoint has two config phases:
+
 1. A `cat > openclaw.json` heredoc for the base structure (gateway, agents defaults, browser)
 2. A `node -e "..."` block that patches channels, plugins, and session settings
 
@@ -197,14 +198,14 @@ c.channels.googlechat = {
   audience: '${WORKER_URL}/googlechat',
   webhookPath: '/googlechat',
   appPrincipal: '103119841339856136234',
-  botUser: 'users/103119841339856136234',   // required for @mention detection
+  botUser: 'users/103119841339856136234', // required for @mention detection
   dm: { policy: 'open', enabled: true, allowFrom: ['*'] },
   groupPolicy: 'open',
-  groupAllowFrom: ['*'],                     // must be ['*'], empty array silently drops all messages
-  replyToMode: 'all',                        // 'off' (default) strips thread ID → new thread each reply
-  typingIndicator: 'none',                   // 'message' mode posts placeholder in wrong thread
-  groups: { 'spaces/AAQAdFhXWNQ': { enabled: true, requireMention: false } }
-};
+  groupAllowFrom: ['*'], // must be ['*'], empty array silently drops all messages
+  replyToMode: 'all', // 'off' (default) strips thread ID → new thread each reply
+  typingIndicator: 'none', // 'message' mode posts placeholder in wrong thread
+  groups: { 'spaces/AAQAdFhXWNQ': { enabled: true, requireMention: false } },
+}
 ```
 
 #### Settings that matter
@@ -215,8 +216,61 @@ Without it the bot receives space messages but cannot detect mentions.
 **`groupAllowFrom`** — must be `['*']`. An empty array or missing field silently
 drops all inbound space messages (no error, no log).
 
+**Google Chat platform limitation** — apps cannot passively monitor all messages
+in a space via the standard webhook. Google Chat only sends webhook events when
+the app is @mentioned.
+
+To monitor ALL space messages, the container runs a Chat REST API polling bridge
+(`/usr/local/lib/chat-bridge.mjs`) that polls `GET /v1/{space}/messages` every 5 seconds.
+
+### Chat bridge setup (one-time)
+
+```bash
+# Space resource name to monitor
+wrangler secret put GOOGLE_CHAT_SPACE
+# Enter: spaces/AAQAdFhXWNQ
+
+# Workspace user the bridge impersonates for polling (must be a member of the space)
+wrangler secret put GOOGLE_CHAT_IMPERSONATE_USER
+# Enter: you@your-domain.com
+```
+
+**Domain-wide delegation (required):** `spaces.messages.list` does NOT accept the app
+scope (`chat.bot`) — polling must use user auth. In Google Admin console →
+Security → Access and data control → API Controls → Domain-wide Delegation, authorize
+the service account's **client ID** (`client_id` in `googlechat-sa.json`) for the scope
+`https://www.googleapis.com/auth/chat.messages.readonly`. The bridge then mints user
+tokens by impersonating `GOOGLE_CHAT_IMPERSONATE_USER` (jwt-bearer with `sub` claim).
+If DWD is not set up, polling fails with 403 and the bridge logs the setup steps.
+
+No Pub/Sub or Workspace Events API required.
+
+**How the bridge works:**
+
+- Polls `chat.googleapis.com/v1/{space}/messages` every 5 seconds with a DWD user token,
+  using `filter=createTime > "<last seen>"` + `orderBy=createTime ASC` (paginated)
+- Resolves the space's `spaceType` once at startup via `spaces.get` (app token, `chat.bot`)
+- Skips bot-authored messages (loop prevention)
+- Skips messages that @mention the bot (delivered by direct webhook — avoids double
+  processing); mentions of other users are still forwarded
+- New messages are forwarded to `localhost:6658/googlechat` as synthetic MESSAGE events
+  using a Google-signed OIDC token from the service account (audience = `WORKER_URL/googlechat`)
+- Waits for the OpenClaw gateway to be healthy before polling
+
+**Auth:** A dist patch (`targets-*.js`) extends OpenClaw's webhook JWT verification to also
+accept the bridge's own service account email — pinned exactly via `CHAT_BRIDGE_SA_EMAIL`,
+which the entrypoint exports from `googlechat-sa.json` at boot. The token must still be
+validly Google-signed with the correct audience URL. (A broader suffix match on
+`*.iam.gserviceaccount.com` would let any GCP service account inject messages.)
+
+Usage pattern for space conversation:
+
+1. Send any message in the space → bridge detects it, bot responds in that thread ✓
+2. @mention messages also work and are handled by the direct webhook path
+
 **`replyToMode`** — controls threading of bot replies. Valid values (confirmed in
 OpenClaw source `extensions/googlechat/src/channel.adapters.ts`):
+
 - `'off'` (default) — strips thread ID; every bot reply creates a new top-level thread
 - `'all'` — bot replies in the same thread as the triggering message
 - `'first'` — only threads the first reply
@@ -248,9 +302,9 @@ and must not be removed.
 
 Current patches:
 
-| File glob | What | Why |
-|---|---|---|
-| `dist/secret-file-*.js` | Skip FS permission check | TigrisFS FUSE ignores chmod |
+| File glob                    | What                             | Why                                                |
+| ---------------------------- | -------------------------------- | -------------------------------------------------- |
+| `dist/secret-file-*.js`      | Skip FS permission check         | TigrisFS FUSE ignores chmod                        |
 | `dist/session-accessor-*.js` | Deterministic JSON serialisation | Prevents "reply session initialization conflicted" |
 
 **Do not patch dist files for Google Chat threading issues** — use the correct
@@ -263,6 +317,7 @@ TigrisFS mounts R2 at `/r2` for backup. FUSE can deadlock, putting any process
 touching `/r2` into uninterruptible D-state (blocking SSH and other operations).
 
 To unmount a deadlocked FUSE mount:
+
 ```bash
 umount -l /r2       # lazy unmount — detaches immediately even when deadlocked
 killall -9 tigrisfs # kill driver so it can be restarted cleanly

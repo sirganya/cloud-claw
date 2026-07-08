@@ -66,6 +66,12 @@ RUN sed -i 's/if (process.platform === "win32") return;/if (process.platform ===
 RUN sed -i 's/function createReplySessionInitializationRevision(entry) {/function _canonicalize(v){if(v===null||typeof v!=="object")return v;if(Array.isArray(v))return v.map(_canonicalize);var r={};Object.keys(v).sort().forEach(function(k){if(v[k]!==undefined)r[k]=_canonicalize(v[k])});return r}function createReplySessionInitializationRevision(entry) {/' /openclaw/dist/session-accessor-*.js
 RUN sed -i 's/return JSON.stringify(entry ?? null);/return JSON.stringify(_canonicalize(entry ?? null));/' /openclaw/dist/session-accessor-*.js
 
+# Patch: also accept the bridge's own SA OIDC token for local webhook auth (#bridge-auth)
+# The chat-bridge signs with the app's SA, not chat@system.gserviceaccount.com.
+# Pinned to the exact SA email (CHAT_BRIDGE_SA_EMAIL, exported by the entrypoint) —
+# a suffix match on *.iam.gserviceaccount.com would let ANY GCP service account
+# mint a valid token for our audience URL and inject messages.
+RUN sed -i 's/if (email === CHAT_ISSUER) return { ok: true };/if (email === CHAT_ISSUER || (process.env.CHAT_BRIDGE_SA_EMAIL \&\& email === process.env.CHAT_BRIDGE_SA_EMAIL.toLowerCase())) return { ok: true };/' /openclaw/dist/targets-*.js
 
 COPY openclaw-build/dist-runtime/ /openclaw/dist-runtime/
 
@@ -73,6 +79,234 @@ RUN printf '%s\n' '#!/usr/bin/env bash' 'exec node /openclaw/dist/index.js "$@"'
 	&& chmod +x /usr/local/bin/openclaw
 
 RUN apt-get update && apt-get install -y --no-install-recommends rsync && rm -rf /var/lib/apt/lists/*
+
+# Chat bridge: polls Google Chat REST API for space messages and forwards to OpenClaw webhook.
+# Avoids Pub/Sub/Workspace Events setup — uses the app's own service account credentials.
+RUN install -m 755 /dev/stdin /usr/local/lib/chat-bridge.mjs <<'EOF'
+#!/usr/bin/env node
+// Polls Google Chat REST API for new space messages and forwards them to the
+// OpenClaw webhook as synthetic MESSAGE events, so the bot can respond to all
+// space messages (Google only sends webhook events when the app is @mentioned).
+//
+// Auth model (see AGENTS.md → Chat bridge):
+// - messages.list rejects the app scope (chat.bot); it requires user auth.
+//   We use domain-wide delegation: the SA impersonates
+//   GOOGLE_CHAT_IMPERSONATE_USER (a space member) with chat.messages.readonly.
+// - spaces.get accepts app auth (chat.bot) — used once to resolve spaceType.
+// - Forwarding authenticates with a Google-signed SA OIDC token
+//   (audience = WORKER_URL/googlechat); the patched verifier (#bridge-auth)
+//   accepts exactly this SA via CHAT_BRIDGE_SA_EMAIL.
+import { readFileSync } from 'fs'
+import { createSign } from 'crypto'
+
+const SPACE = process.env.GOOGLE_CHAT_SPACE                   // e.g. spaces/AAQAdFhXWNQ
+const IMPERSONATE = process.env.GOOGLE_CHAT_IMPERSONATE_USER  // space member to read as
+const WORKER_URL = process.env.WORKER_URL
+const PORT = process.env.PORT || 6658
+const STATE_DIR = process.env.OPENCLAW_STATE_DIR || '/data'
+const SA_PATH = `${STATE_DIR}/googlechat-sa.json`
+const WEBHOOK_AUDIENCE = `${WORKER_URL}/googlechat`
+const LOCAL_WEBHOOK = `http://localhost:${PORT}/googlechat`
+const TOKEN_URL = 'https://oauth2.googleapis.com/token'
+const POLL_MS = 5_000
+
+if (!SPACE || !WORKER_URL || !IMPERSONATE) {
+  console.log('[chat-bridge] GOOGLE_CHAT_SPACE, GOOGLE_CHAT_IMPERSONATE_USER or WORKER_URL not set — exiting')
+  process.exit(0)
+}
+
+let sa
+try {
+  sa = JSON.parse(readFileSync(SA_PATH, 'utf8'))
+} catch {
+  console.log('[chat-bridge] No service account at', SA_PATH, '— exiting')
+  process.exit(0)
+}
+
+// Bot identity for mention filtering — same source OpenClaw uses (channels.googlechat.botUser)
+let botUser = null
+try {
+  botUser = JSON.parse(readFileSync(`${STATE_DIR}/openclaw.json`, 'utf8')).channels?.googlechat?.botUser ?? null
+} catch {}
+
+// Cloudflare log ingestion splits stdout per line — Google API error bodies are
+// pretty-printed multi-line JSON, so collapse them or one error becomes N garbage
+// log records ("message": "{").
+const oneLine = s => String(s).replace(/\s*\n\s*/g, ' ')
+
+function signJwt(claims) {
+  const enc = o => Buffer.from(JSON.stringify(o)).toString('base64url')
+  const hdr = enc({ alg: 'RS256', typ: 'JWT' })
+  const pld = enc(claims)
+  const s = createSign('RSA-SHA256')
+  s.update(`${hdr}.${pld}`)
+  return `${hdr}.${pld}.${s.sign(sa.private_key, 'base64url')}`
+}
+
+async function googleToken(extra, wantIdToken = false) {
+  const now = Math.floor(Date.now() / 1_000)
+  const assertion = signJwt({
+    iss: sa.client_email,
+    aud: TOKEN_URL,
+    iat: now, exp: now + 3_600, ...extra,
+  })
+  const res = await fetch(TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion }),
+  })
+  const d = await res.json()
+  if (!res.ok) throw new Error(`Token exchange failed: ${JSON.stringify(d)}`)
+  return wantIdToken ? d.id_token : d.access_token
+}
+
+const cache = {}
+async function cachedToken(kind, mint) {
+  const now = Math.floor(Date.now() / 1_000)
+  const hit = cache[kind]
+  if (hit && hit.exp > now + 60) return hit.token
+  const token = await mint()
+  cache[kind] = { token, exp: now + 3_500 }
+  return token
+}
+
+// User token via domain-wide delegation — the only auth messages.list accepts here
+const userToken = () => cachedToken('user', () =>
+  googleToken({ sub: IMPERSONATE, scope: 'https://www.googleapis.com/auth/chat.messages.readonly' }))
+// App token (chat.bot) — valid for spaces.get, NOT for messages.list
+const appToken = () => cachedToken('app', () =>
+  googleToken({ scope: 'https://www.googleapis.com/auth/chat.bot' }))
+// Google-signed SA OIDC token for authenticating to the local webhook
+const oidcToken = () => cachedToken('oidc', () =>
+  googleToken({ target_audience: WEBHOOK_AUDIENCE }, true))
+
+async function waitForGateway() {
+  for (let i = 0; i < 60; i++) {
+    try {
+      const r = await fetch(`http://localhost:${PORT}/health`)
+      if (r.ok) return
+    } catch {}
+    await new Promise(r => setTimeout(r, 2_000))
+  }
+  console.error('[chat-bridge] Gateway not ready after 2 min — exiting')
+  process.exit(1)
+}
+
+// Full space object (with spaceType) so OpenClaw's group detection doesn't rely
+// on fallbacks — messages.list results don't carry spaceType.
+let space = { name: SPACE, spaceType: 'SPACE' }
+async function resolveSpace() {
+  try {
+    const t = await appToken()
+    const r = await fetch(`https://chat.googleapis.com/v1/${SPACE}`, { headers: { Authorization: `Bearer ${t}` } })
+    if (r.ok) {
+      space = await r.json()
+      return
+    }
+    console.error('[chat-bridge] spaces.get failed', r.status, oneLine(await r.text().catch(() => '')))
+  } catch (e) {
+    console.error('[chat-bridge] spaces.get error:', e.message)
+  }
+  console.error('[chat-bridge] Using fallback space object (spaceType=SPACE)')
+}
+
+// Only skip messages that @mention the BOT — those arrive via the direct
+// Google webhook and would be processed twice. Mentions of other users must
+// still be forwarded.
+function mentionsBot(msg) {
+  const targets = new Set(['users/app', botUser].filter(Boolean))
+  return (msg.annotations ?? [])
+    .some(a => a.type === 'USER_MENTION' && targets.has(a.userMention?.user?.name))
+}
+
+// Exact createTime of the newest processed message. The server-side filter is
+// strictly greater-than, so we pass back Google's own full-precision timestamp
+// instead of comparing strings locally (mixed fractional precision breaks
+// lexicographic order).
+let lastCreateTime = new Date().toISOString()
+
+async function fetchNewMessages(token) {
+  const out = []
+  let pageToken
+  do {
+    const qs = new URLSearchParams({
+      filter: `createTime > "${lastCreateTime}"`,
+      orderBy: 'createTime ASC',
+      pageSize: '100',
+    })
+    if (pageToken) qs.set('pageToken', pageToken)
+    const r = await fetch(`https://chat.googleapis.com/v1/${SPACE}/messages?${qs}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+    if (!r.ok) {
+      const body = oneLine(await r.text().catch(() => ''))
+      if (r.status === 403) {
+        console.error(
+          '[chat-bridge] 403 from messages.list — check domain-wide delegation:',
+          `authorize client ID ${sa.client_id} for scope chat.messages.readonly in the Admin console,`,
+          `and ensure ${IMPERSONATE} is a member of ${SPACE}.`, body,
+        )
+      } else {
+        console.error('[chat-bridge] Chat API error', r.status, body)
+      }
+      return out
+    }
+    const data = await r.json()
+    out.push(...(data.messages ?? []))
+    pageToken = data.nextPageToken
+  } while (pageToken)
+  return out
+}
+
+async function forward(msg) {
+  // Reply threading: OpenClaw replies into message.thread.name
+  // (extensions/googlechat/src/monitor.ts → replyToId → outbound thread).
+  // threadReply is false for top-level messages, so stripping thread there
+  // makes the reply post top-level; in-thread messages keep their thread.
+  const message = msg.threadReply ? msg : { ...msg, thread: undefined }
+  const evt = {
+    type: 'MESSAGE',
+    eventTime: msg.createTime,
+    space,
+    message,
+    user: msg.sender,
+  }
+  const ot = await oidcToken()
+  const fw = await fetch(LOCAL_WEBHOOK, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ot}` },
+    body: JSON.stringify(evt),
+  })
+  if (!fw.ok) {
+    console.error('[chat-bridge] Forward failed', fw.status, oneLine(await fw.text().catch(() => '')))
+  } else {
+    console.log('[chat-bridge] Forwarded message from', msg.sender?.displayName ?? msg.sender?.name ?? 'unknown')
+  }
+}
+
+async function pollOnce() {
+  const token = await userToken()
+  const msgs = await fetchNewMessages(token) // createTime ASC
+  for (const msg of msgs) {
+    const fromBot = msg.sender?.type === 'BOT' || msg.sender?.name === 'users/app'
+    if (fromBot || mentionsBot(msg)) continue
+    try {
+      await forward(msg)
+    } catch (e) {
+      console.error('[chat-bridge] Error:', e.message)
+    }
+  }
+  if (msgs.length > 0) lastCreateTime = msgs[msgs.length - 1].createTime
+}
+
+console.log('[chat-bridge] Waiting for gateway...')
+await waitForGateway()
+await resolveSpace()
+console.log('[chat-bridge] Ready — polling', SPACE, 'as', IMPERSONATE)
+const tick = () => pollOnce().catch(e => console.error('[chat-bridge] Poll error:', e.message))
+await tick()
+setInterval(tick, POLL_MS)
+EOF
 
 RUN install -m 755 /dev/stdin /entrypoint.sh <<'EOF'
 #!/bin/bash
@@ -187,6 +421,7 @@ cleanup() {
 		done
 	fi
 	[ -n "$BACKUP_PID" ] && kill "$BACKUP_PID" 2>/dev/null
+	[ -n "$CHAT_BRIDGE_PID" ] && kill "$CHAT_BRIDGE_PID" 2>/dev/null
 	if [ -n "$OPENCLAW_PID" ]; then
 		kill -TERM "$OPENCLAW_PID" 2>/dev/null
 		wait "$OPENCLAW_PID" 2>/dev/null
@@ -365,8 +600,21 @@ echo "[INFO] Starting OpenClaw Gateway..."
 echo "[INFO] Visit Web UI for initial setup on first use"
 cd "$OPENCLAW_WORKSPACE_DIR"
 
+# Exact SA email the patched webhook verifier accepts for bridge tokens (#bridge-auth)
+if [ -f "$STATE_DIR/googlechat-sa.json" ]; then
+	export CHAT_BRIDGE_SA_EMAIL=$(node -p "JSON.parse(require('fs').readFileSync('$STATE_DIR/googlechat-sa.json','utf8')).client_email")
+	echo "[INFO] Bridge SA email pinned: $CHAT_BRIDGE_SA_EMAIL"
+fi
+
 openclaw gateway --port 6658 --bind lan --allow-unconfigured &
 OPENCLAW_PID=$!
+
+if [ -n "$GOOGLE_CHAT_SPACE" ]; then
+	node /usr/local/lib/chat-bridge.mjs &
+	CHAT_BRIDGE_PID=$!
+	echo "[INFO] Chat bridge started (PID $CHAT_BRIDGE_PID), polling $GOOGLE_CHAT_SPACE"
+fi
+
 wait $OPENCLAW_PID
 EOF
 
