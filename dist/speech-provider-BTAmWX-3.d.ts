@@ -1,5 +1,0 @@
-import { qn as SpeechProviderPlugin } from "./types-6kOfVdoQ.js";
-//#region extensions/openrouter/speech-provider.d.ts
-declare function buildOpenRouterSpeechProvider(): SpeechProviderPlugin;
-//#endregion
-export { buildOpenRouterSpeechProvider as t };

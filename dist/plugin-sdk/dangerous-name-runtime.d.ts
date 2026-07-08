@@ -1,2 +1,0 @@
-import { n as isDangerousNameMatchingEnabled, r as resolveDangerousNameMatchingEnabled } from "./dangerous-name-matching-BTHB7W93.js";
-export { isDangerousNameMatchingEnabled, resolveDangerousNameMatchingEnabled };
