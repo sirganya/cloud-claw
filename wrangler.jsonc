@@ -55,13 +55,19 @@
       },
     ],
   },
-  // Wake container before scheduled in-gateway work (Cloudflare crons are UTC-only):
-  // - 02:50 nightly dream sweep (dreaming runs at 03:00 UTC)
-  // - 07:55/08:55 + 13:55/14:55 status reports at 09:00/15:00 Europe/Dublin,
-  //   covering both IST (UTC+1) and GMT (UTC+0); the tz-aware gateway cron
-  //   fires at the exact local time, spurious wakes just idle ~10 min.
+  // Wake container 5 min before every in-gateway cron job (Cloudflare crons are
+  // UTC-only; the tz-aware gateway cron fires at the exact local time). Each
+  // Europe/Dublin job needs two wakes — IST (UTC+1) and GMT (UTC+0) — since
+  // Cloudflare crons don't observe DST; the spurious wake in the other season
+  // just idles ~10 min via sleepAfter. Sourced from `openclaw cron list --all`:
+  //   - Memory Dreaming Promotion   0 3 * * *      UTC            -> 02:55
+  //   - status-report-morning      0 9 * * *      Europe/Dublin  -> 07:55 / 08:55
+  //   - lead-scout                 5 9 * * *      Europe/Dublin  -> 08:00 / 09:00
+  //   - daily-standup              15 9 * * 1-5   Europe/Dublin  -> 08:10 / 09:10
+  //   - status-report-afternoon    0 15 * * *     Europe/Dublin  -> 13:55 / 14:55
+  // Re-derive this list with `openclaw cron list --all --json` if gateway jobs change.
   "triggers": {
-    "crons": ["55 2,7,8,13 * * *"],
+    "crons": ["55 2,7,8,13,14 * * *", "0 8,9 * * *", "10 8,9 * * *"],
   },
   "migrations": [
     {
