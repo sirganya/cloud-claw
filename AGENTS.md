@@ -32,7 +32,7 @@ src/
 
 wrangler.jsonc        # Wrangler config (containers, bindings, placement)
 tsconfig.json         # TypeScript config (ES2024, strict, bundler resolution)
-Dockerfile            # Container image: OpenClaw gateway + TigrisFS S3 mount
+Dockerfile            # Container image: OpenClaw gateway + rclone R2 backup sync
 worker-configuration.d.ts  # Auto-generated Cloudflare bindings (DO NOT EDIT)
 .oxfmtrc.json         # Formatter config (single quotes, no semicolons, spaces)
 ```
@@ -134,6 +134,7 @@ const res = await browser.fetch('http://cloudflare.browser/v1/acquire')
 | `S3_ACCESS_KEY_ID`       | S3 access key                               |
 | `S3_SECRET_ACCESS_KEY`   | S3 secret key                               |
 | `S3_PREFIX`              | S3 key prefix (optional)                    |
+| `GH_TOKEN`               | GitHub fine-grained PAT for the `gh` CLI (GitHub skill; scope to allowed repos only) |
 
 **Bindings** (in `wrangler.jsonc`):
 
@@ -204,7 +205,10 @@ c.channels.googlechat = {
   groupAllowFrom: ['*'], // must be ['*'], empty array silently drops all messages
   replyToMode: 'all', // 'off' (default) strips thread ID → new thread each reply
   typingIndicator: 'none', // 'message' mode posts placeholder in wrong thread
-  groups: { 'spaces/AAQAdFhXWNQ': { enabled: true, requireMention: false } },
+  groups: {
+    'spaces/AAQAdFhXWNQ': { enabled: true, requireMention: false },
+    'spaces/AAQAkEQWJXA': { enabled: true, requireMention: false },
+  },
 }
 ```
 
@@ -226,14 +230,27 @@ To monitor ALL space messages, the container runs a Chat REST API polling bridge
 ### Chat bridge setup (one-time)
 
 ```bash
-# Space resource name to monitor
+# Space resource name(s) to monitor — comma-separated for multiple spaces
 wrangler secret put GOOGLE_CHAT_SPACE
-# Enter: spaces/AAQAdFhXWNQ
+# Enter: spaces/AAQAdFhXWNQ,spaces/AAQAkEQWJXA
 
-# Workspace user the bridge impersonates for polling (must be a member of the space)
+# Workspace user the bridge impersonates for polling (must be a member of EVERY space above)
 wrangler secret put GOOGLE_CHAT_IMPERSONATE_USER
 # Enter: you@your-domain.com
 ```
+
+The bridge (`chat-bridge.mjs`) supports multiple spaces natively: it splits
+`GOOGLE_CHAT_SPACE` on commas and polls each independently with its own cursor
+(`lastCreateTime`) and resolved space object, isolated in a `Map` keyed by space
+name — one space's poll/forward failure never affects another's. Adding a space
+requires **both**:
+1. Adding it to `GOOGLE_CHAT_SPACE` (comma-separated) — covers non-mention polling
+2. Adding it to `channels.googlechat.groups` in the entrypoint config — covers the
+   direct @mention webhook path
+
+`GOOGLE_CHAT_IMPERSONATE_USER` must be a member of every space in the list, or
+`messages.list` returns 403 for that space specifically (the bridge logs which
+space failed and continues polling the others).
 
 **Domain-wide delegation (required):** `spaces.messages.list` does NOT accept the app
 scope (`chat.bot`) — polling must use user auth. In Google Admin console →
@@ -304,32 +321,126 @@ Current patches:
 
 | File glob                    | What                             | Why                                                |
 | ---------------------------- | -------------------------------- | -------------------------------------------------- |
-| `dist/secret-file-*.js`      | Skip FS permission check         | TigrisFS FUSE ignores chmod                        |
+| `dist/secret-file-*.js`      | Skip FS permission check         | Historical (FUSE ignored chmod); kept as harmless  |
 | `dist/session-accessor-*.js` | Deterministic JSON serialisation | Prevents "reply session initialization conflicted" |
+| `dist/targets-*.js`          | Accept bridge SA OIDC token      | Chat bridge webhook auth (#bridge-auth)            |
 
 **Do not patch dist files for Google Chat threading issues** — use the correct
 config (`typingIndicator: "message"`, `replyToMode: "all"`) instead. The plugin
 is well-tested and handles threading correctly with the right config.
 
-### FUSE / TigrisFS
+### R2 backup (rclone — no FUSE)
 
-TigrisFS mounts R2 at `/r2` for backup. FUSE can deadlock, putting any process
-touching `/r2` into uninterruptible D-state (blocking SSH and other operations).
+State lives on local disk (`/data`). R2 is durable backup only, synced by
+rclone over plain S3 API calls every 5 minutes plus a final backup on shutdown.
+There is **no FUSE mount** (the previous TigrisFS `/r2` mount could deadlock,
+putting processes into uninterruptible D-state and wedging the container —
+with rclone a network stall is just a timeout).
 
-To unmount a deadlocked FUSE mount:
+Rules baked into `entrypoint.sh`:
 
-```bash
-umount -l /r2       # lazy unmount — detaches immediately even when deadlocked
-killall -9 tigrisfs # kill driver so it can be restarted cleanly
-```
+- **Live SQLite files are never copied raw.** `*.sqlite` and WAL/SHM/journal
+  sidecars are excluded from dir syncs; consistent copies are taken with
+  `sqlite3 .backup` into a staging dir and uploaded to `sqlite-snapshots/` on
+  the remote (mirroring `/data`-relative paths). Restore copies dirs first,
+  then overlays the snapshots. Legacy fallback: if `sqlite-snapshots/` does
+  not exist yet, raw `.sqlite` files are restored (WAL/SHM still excluded).
+- **`rclone sync` (remote deletes) only runs after a proven-good restore**
+  (`RESTORE_OK`). If restore failed or the bucket was unreachable, backups run
+  in `copy` mode so a partial/empty local dir cannot wipe the R2 backup.
+- **S3 credentials are scrubbed from the environment** before the gateway and
+  chat bridge start. They live in unexported shell vars and are passed
+  per-invocation to rclone (`run_rclone`). The agent runs as root, so this is
+  hygiene, not a security boundary — `/proc/1/environ` still holds them.
 
-Do **not** use `fusermount -u` on a deadlocked mount — it hangs indefinitely.
+### Container lifecycle (Worker side)
 
-The `fuse_watchdog` loop in `entrypoint.sh` checks every 60 s with a 10 s
-timeout and runs the above automatically on deadlock.
+`src/container.ts` handles keep-alive and auto-recovery — Docker `HEALTHCHECK`
+is **ignored** by Cloudflare Containers:
 
-State lives on local disk (`/data`). R2 is backup only — a FUSE deadlock does
-not lose data, it only blocks backup syncs until remount.
+- **Activity renewal**: the DO opens an operator WebSocket to the gateway
+  (`role: operator`, `scopes: ['operator.read']`) and renews the `sleepAfter`
+  timeout on real-work events (`chat`, `agent.request`, `exec.*`, `tool`).
+  Heartbeat events (`tick`, `pong`, presence) deliberately do not renew, or
+  the container would never sleep. This is required because the chat bridge
+  posts to `localhost` and long agent runs are invisible to the DO.
+- **Auto-recovery**: a 5-minute health probe (`/health`, only while the
+  container is running — probing would wake a sleeper) destroys and restarts
+  the container after 3 consecutive failures.
+
+### Scheduled status reports (cron)
+
+Two OpenClaw cron jobs (`status-report-morning`, `status-report-afternoon`)
+run at **09:00 and 15:00 Europe/Dublin** in an isolated session. Each compiles
+email/task status and sends three Google Chat messages via the `message` tool:
+
+- DM to Greg (`spaces/ib7w3yAAAAE`)
+- DM to Liz (`spaces/k5sNMKAAAAE`) — her own email/tasks, degrades to a note
+  if her account data is not accessible
+- PM-style update to the QuickPoint team space (`spaces/AAQAdFhXWNQ`), which
+  is also the `--announce` fallback target if the agent fails to send
+
+Wiring:
+
+- Jobs are created idempotently by `setup_report_crons` in `entrypoint.sh`
+  (background: waits for gateway health, checks `openclaw cron list --all` by
+  name, then `openclaw cron add --cron ... --tz Europe/Dublin --exact`). They
+  persist in `state/openclaw.sqlite`, so they survive restarts via R2 backup.
+- Cloudflare cron triggers are UTC-only (no DST), so `wrangler.jsonc` wakes
+  the container at `55 7,8,13,14 * * *` UTC — 5 minutes before every
+  possible IST/GMT firing time. The in-gateway scheduler (tz-aware) fires at
+  the exact local time; the two spurious wakes per day just idle ~10 minutes.
+- A retired `status-report-evening` (21:00) job is removed on boot if a
+  previous deployment persisted it.
+- The chat bridge's wake notice is suppressed in narrow windows around these
+  wakes (`inQuietWakeWindow`) so automated boots do not post "Waking up".
+
+### Lead scout (daily cron)
+
+A third gateway cron job, `lead-scout`, runs at **09:05 Europe/Dublin**
+(isolated session) and searches the web for potential clients and sales
+opportunities (tenders, RFPs, job postings, funding news). It posts the 3–5
+best new leads as one numbered message to the QuickPoint team space and asks
+Greg/Liz for thread-reply feedback. No new Worker wake is needed: the 09:00
+status report's activity renews the 10-minute sleep timer through 09:05.
+
+- **Search stack**: built-in `web_search` tool via the free DuckDuckGo
+  provider (no API key). Enabled in the entrypoint config patch:
+  `plugins.entries.duckduckgo` + `tools.web.search = { enabled, provider:
+  'duckduckgo' }`. `web_fetch` (always available) verifies results.
+- **Learning loop** (all files R2-persisted in the workspace):
+  - `leads/search-profile.md` — strategy + feedback learnings. Seeded once by
+    the entrypoint; owned/evolved by the agent afterwards.
+  - `leads/history.md` — append-only log of every run (date, queries, leads)
+    used for dedupe; created by the agent on first run.
+  - Feedback arrives as thread replies in normal chat sessions (the bridge
+    forwards them), so a marker-guarded workspace AGENTS.md instruction
+    (`cloud-claw:lead-feedback`) tells every session to record verdicts and
+    reasons into the profile the cron scout reads next morning.
+- On days with nothing new the scout skips the chat message but still logs
+  the attempted queries.
+- Job creation is idempotent in `setup_report_crons` (same pattern as the
+  status reports, `--timeout-seconds 900`, announce fallback to the team
+  space).
+
+### GitHub skill (@steipete/github)
+
+The [ClawHub](https://clawhub.ai) skill `@steipete/github` teaches the agent to
+use the `gh` GitHub CLI (PRs, CI status, workflow logs, `gh api`).
+
+- **`gh` binary**: installed in the Dockerfile image layer (`ARG GH_VERSION`,
+  arch-aware GitHub release tarball, same pattern as rclone/gog).
+- **Skill install**: idempotent block in `entrypoint.sh` runs
+  `openclaw skills install @steipete/github --acknowledge-clawhub-risk` when
+  `$OPENCLAW_WORKSPACE_DIR/skills/github` is missing. It runs before gateway
+  start (skills load once at startup) and is non-fatal on ClawHub outages.
+  The install dir lives in the workspace, so it persists via R2 backup.
+- **Auth / repo scoping**: `gh` reads `GH_TOKEN` from the environment (no
+  `gh auth login`). Set it as a Worker secret (`npx wrangler secret put GH_TOKEN`);
+  `container.ts` forwards all string env vars to the container automatically.
+  Access control lives in the token itself: use a **fine-grained PAT
+  restricted to the single allowed private repo** — the agent then cannot see
+  any other private repos. The S3 credential scrub does not touch `GH_TOKEN`.
 
 ### SSH into the container
 

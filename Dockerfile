@@ -3,26 +3,30 @@ FROM nikolaik/python-nodejs:python3.12-nodejs22-bookworm
 ENV NODE_ENV=production
 ENV PORT=6658
 
-ARG TIGRISFS_VERSION=1.2.1
+ARG RCLONE_VERSION=1.68.2
 ARG GOGCLI_VERSION=0.31.1
+ARG GH_VERSION=2.96.0
 
+# rclone replaces the tigrisfs FUSE mount: R2 sync happens over plain S3 API
+# calls, so a network stall is a timeout instead of a D-state kernel hang.
+# sqlite3 is needed for atomic .backup snapshots of live databases.
 RUN set -eux; \
 	apt-get update; \
 	apt-get install -y --no-install-recommends \
-		fuse \
 		ca-certificates \
-		curl; \
+		curl \
+		sqlite3; \
 	corepack enable pnpm; \
-	if [ "$(uname -m)" = "x86_64" ]; then \
-		curl -fsSL "https://github.com/tigrisdata/tigrisfs/releases/download/v${TIGRISFS_VERSION}/tigrisfs_${TIGRISFS_VERSION}_linux_amd64.deb" -o /tmp/tigrisfs.deb; \
-		dpkg -i /tmp/tigrisfs.deb; \
-		rm -f /tmp/tigrisfs.deb; \
-	else \
-		echo "tigrisfs not available for arm64"; \
-	fi; \
+	ARCH="$(dpkg --print-architecture)"; \
+	curl -fsSL "https://downloads.rclone.org/v${RCLONE_VERSION}/rclone-v${RCLONE_VERSION}-linux-${ARCH}.deb" -o /tmp/rclone.deb; \
+	dpkg -i /tmp/rclone.deb; \
+	rm -f /tmp/rclone.deb; \
 	curl -fsSL "https://github.com/openclaw/gogcli/releases/download/v${GOGCLI_VERSION}/gogcli_${GOGCLI_VERSION}_linux_amd64.tar.gz" -o /tmp/gogcli.tar.gz; \
 	tar -xzf /tmp/gogcli.tar.gz -C /usr/local/bin gog; \
 	rm -f /tmp/gogcli.tar.gz; \
+	curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${ARCH}.tar.gz" -o /tmp/gh.tar.gz; \
+	tar -xzf /tmp/gh.tar.gz -C /usr/local/bin --strip-components=2 "gh_${GH_VERSION}_linux_${ARCH}/bin/gh"; \
+	rm -f /tmp/gh.tar.gz; \
 	rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 # node_modules split into layers by size (~2.3GB total)
@@ -78,8 +82,6 @@ COPY openclaw-build/dist-runtime/ /openclaw/dist-runtime/
 RUN printf '%s\n' '#!/usr/bin/env bash' 'exec node /openclaw/dist/index.js "$@"' > /usr/local/bin/openclaw \
 	&& chmod +x /usr/local/bin/openclaw
 
-RUN apt-get update && apt-get install -y --no-install-recommends rsync && rm -rf /var/lib/apt/lists/*
-
 # Chat bridge: polls Google Chat REST API for space messages and forwards to OpenClaw webhook.
 # Avoids Pub/Sub/Workspace Events setup — uses the app's own service account credentials.
 RUN install -m 755 /dev/stdin /usr/local/lib/chat-bridge.mjs <<'EOF'
@@ -99,8 +101,9 @@ RUN install -m 755 /dev/stdin /usr/local/lib/chat-bridge.mjs <<'EOF'
 import { readFileSync } from 'fs'
 import { createSign } from 'crypto'
 
-const SPACE = process.env.GOOGLE_CHAT_SPACE                   // e.g. spaces/AAQAdFhXWNQ
-const IMPERSONATE = process.env.GOOGLE_CHAT_IMPERSONATE_USER  // space member to read as
+const SPACES = (process.env.GOOGLE_CHAT_SPACE || '')       // comma-separated, e.g. spaces/AAQAdFhXWNQ,spaces/AAQAkEQWJXA
+  .split(',').map(s => s.trim()).filter(Boolean)
+const IMPERSONATE = process.env.GOOGLE_CHAT_IMPERSONATE_USER  // space member to read as (must be a member of every space above)
 const WORKER_URL = process.env.WORKER_URL
 const PORT = process.env.PORT || 6658
 const STATE_DIR = process.env.OPENCLAW_STATE_DIR || '/data'
@@ -110,7 +113,7 @@ const LOCAL_WEBHOOK = `http://localhost:${PORT}/googlechat`
 const TOKEN_URL = 'https://oauth2.googleapis.com/token'
 const POLL_MS = 5_000
 
-if (!SPACE || !WORKER_URL || !IMPERSONATE) {
+if (SPACES.length === 0 || !WORKER_URL || !IMPERSONATE) {
   console.log('[chat-bridge] GOOGLE_CHAT_SPACE, GOOGLE_CHAT_IMPERSONATE_USER or WORKER_URL not set — exiting')
   process.exit(0)
 }
@@ -192,22 +195,71 @@ async function waitForGateway() {
   process.exit(1)
 }
 
+// Per-space state: resolved space object (with spaceType, for OpenClaw's group
+// detection) and the polling cursor. Keyed by space resource name so multiple
+// spaces poll independently — one space's failure never affects another's.
+const spaceState = new Map(SPACES.map(name => [name, {
+  space: { name, spaceType: 'SPACE' },
+  lastCreateTime: new Date().toISOString(),
+}]))
+
 // Full space object (with spaceType) so OpenClaw's group detection doesn't rely
 // on fallbacks — messages.list results don't carry spaceType.
-let space = { name: SPACE, spaceType: 'SPACE' }
-async function resolveSpace() {
+async function resolveSpace(name) {
+  const st = spaceState.get(name)
   try {
     const t = await appToken()
-    const r = await fetch(`https://chat.googleapis.com/v1/${SPACE}`, { headers: { Authorization: `Bearer ${t}` } })
+    const r = await fetch(`https://chat.googleapis.com/v1/${name}`, { headers: { Authorization: `Bearer ${t}` } })
     if (r.ok) {
-      space = await r.json()
+      st.space = await r.json()
       return
     }
-    console.error('[chat-bridge] spaces.get failed', r.status, oneLine(await r.text().catch(() => '')))
+    console.error('[chat-bridge]', name, 'spaces.get failed', r.status, oneLine(await r.text().catch(() => '')))
   } catch (e) {
-    console.error('[chat-bridge] spaces.get error:', e.message)
+    console.error('[chat-bridge]', name, 'spaces.get error:', e.message)
   }
-  console.error('[chat-bridge] Using fallback space object (spaceType=SPACE)')
+  console.error('[chat-bridge]', name, 'Using fallback space object (spaceType=SPACE)')
+}
+
+// Wake-up notice: the bridge starts once per container boot, so this fires on
+// every cold start. Cold starts are slow (R2 restore + gateway load + agent
+// boot) — post a short note so the user isn't staring at "is typing" silence.
+// Skipped during automated wakes (nobody is waiting on a reply) and when the
+// gateway is already healthy (bridge-only restart).
+function inQuietWakeWindow() {
+  const now = new Date()
+  const h = now.getUTCHours(), m = now.getUTCMinutes()
+  // Nightly dream wake (Worker cron 02:50 UTC; dreaming runs until ~04:35)
+  if ((h === 2 && m >= 45) || h === 3 || (h === 4 && m <= 35)) return true
+  // Status-report wakes: Worker cron fires at 07:55/08:55/13:55/14:55 UTC so
+  // the 09:00/15:00 Europe/Dublin jobs can run across DST. A boot within a few
+  // minutes of those wakes is automated; user-triggered boots outside these
+  // narrow windows still get the notice.
+  if (m >= 50 && [7, 8, 13, 14].includes(h)) return true
+  if (m <= 10 && [8, 9, 14, 15].includes(h)) return true
+  return false
+}
+
+async function announceWake() {
+  if (inQuietWakeWindow()) return
+  try {
+    const r = await fetch(`http://localhost:${PORT}/health`, { signal: AbortSignal.timeout(1_000) })
+    if (r.ok) return // gateway already up — not a cold start
+  } catch {}
+  for (const name of SPACES) {
+    try {
+      const t = await appToken()
+      const r = await fetch(`https://chat.googleapis.com/v1/${name}/messages`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${t}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: '_Waking up — loading memory, back with you shortly..._' }),
+      })
+      if (!r.ok) console.error('[chat-bridge]', name, 'Wake notice failed', r.status, oneLine(await r.text().catch(() => '')))
+      else console.log('[chat-bridge]', name, 'Wake notice posted')
+    } catch (e) {
+      console.error('[chat-bridge]', name, 'Wake notice error:', e.message)
+    }
+  }
 }
 
 // Only skip messages that @mention the BOT — those arrive via the direct
@@ -219,13 +271,12 @@ function mentionsBot(msg) {
     .some(a => a.type === 'USER_MENTION' && targets.has(a.userMention?.user?.name))
 }
 
-// Exact createTime of the newest processed message. The server-side filter is
-// strictly greater-than, so we pass back Google's own full-precision timestamp
-// instead of comparing strings locally (mixed fractional precision breaks
-// lexicographic order).
-let lastCreateTime = new Date().toISOString()
+// Exact createTime of the newest processed message per space. The server-side
+// filter is strictly greater-than, so we pass back Google's own full-precision
+// timestamp instead of comparing strings locally (mixed fractional precision
+// breaks lexicographic order). Cursor lives in spaceState (per-space).
 
-async function fetchNewMessages(token) {
+async function fetchNewMessages(token, name, lastCreateTime) {
   const out = []
   let pageToken
   do {
@@ -235,19 +286,19 @@ async function fetchNewMessages(token) {
       pageSize: '100',
     })
     if (pageToken) qs.set('pageToken', pageToken)
-    const r = await fetch(`https://chat.googleapis.com/v1/${SPACE}/messages?${qs}`, {
+    const r = await fetch(`https://chat.googleapis.com/v1/${name}/messages?${qs}`, {
       headers: { Authorization: `Bearer ${token}` },
     })
     if (!r.ok) {
       const body = oneLine(await r.text().catch(() => ''))
       if (r.status === 403) {
         console.error(
-          '[chat-bridge] 403 from messages.list — check domain-wide delegation:',
+          '[chat-bridge]', name, '403 from messages.list — check domain-wide delegation:',
           `authorize client ID ${sa.client_id} for scope chat.messages.readonly in the Admin console,`,
-          `and ensure ${IMPERSONATE} is a member of ${SPACE}.`, body,
+          `and ensure ${IMPERSONATE} is a member of ${name}.`, body,
         )
       } else {
-        console.error('[chat-bridge] Chat API error', r.status, body)
+        console.error('[chat-bridge]', name, 'Chat API error', r.status, body)
       }
       return out
     }
@@ -258,7 +309,7 @@ async function fetchNewMessages(token) {
   return out
 }
 
-async function forward(msg) {
+async function forward(msg, space) {
   // Reply threading: OpenClaw replies into message.thread.name
   // (extensions/googlechat/src/monitor.ts → replyToId → outbound thread).
   // threadReply is false for top-level messages, so stripping thread there
@@ -286,23 +337,31 @@ async function forward(msg) {
 
 async function pollOnce() {
   const token = await userToken()
-  const msgs = await fetchNewMessages(token) // createTime ASC
-  for (const msg of msgs) {
-    const fromBot = msg.sender?.type === 'BOT' || msg.sender?.name === 'users/app'
-    if (fromBot || mentionsBot(msg)) continue
+  for (const name of SPACES) {
+    const st = spaceState.get(name)
     try {
-      await forward(msg)
+      const msgs = await fetchNewMessages(token, name, st.lastCreateTime) // createTime ASC
+      for (const msg of msgs) {
+        const fromBot = msg.sender?.type === 'BOT' || msg.sender?.name === 'users/app'
+        if (fromBot || mentionsBot(msg)) continue
+        try {
+          await forward(msg, st.space)
+        } catch (e) {
+          console.error('[chat-bridge]', name, 'Error:', e.message)
+        }
+      }
+      if (msgs.length > 0) st.lastCreateTime = msgs[msgs.length - 1].createTime
     } catch (e) {
-      console.error('[chat-bridge] Error:', e.message)
+      console.error('[chat-bridge]', name, 'Poll error:', e.message)
     }
   }
-  if (msgs.length > 0) lastCreateTime = msgs[msgs.length - 1].createTime
 }
 
+await announceWake()
 console.log('[chat-bridge] Waiting for gateway...')
 await waitForGateway()
-await resolveSpace()
-console.log('[chat-bridge] Ready — polling', SPACE, 'as', IMPERSONATE)
+await Promise.all(SPACES.map(resolveSpace))
+console.log('[chat-bridge] Ready — polling', SPACES.join(', '), 'as', IMPERSONATE)
 const tick = () => pollOnce().catch(e => console.error('[chat-bridge] Poll error:', e.message))
 await tick()
 setInterval(tick, POLL_MS)
@@ -312,11 +371,11 @@ RUN install -m 755 /dev/stdin /entrypoint.sh <<'EOF'
 #!/bin/bash
 set -e
 
-R2_MOUNT="/r2"
 STATE_DIR="/data"
 
-# State on LOCAL disk — fast, consistent reads/writes for sessions and SQLite
-# R2 for durable backup only (credentials, workspace, agent history)
+# State on LOCAL disk — fast, consistent reads/writes for sessions and SQLite.
+# R2 is durable backup only, accessed via rclone S3 API calls (no FUSE mount:
+# a network stall is a timeout, not a D-state hang that wedges the container).
 export OPENCLAW_STATE_DIR="$STATE_DIR"
 export OPENCLAW_WORKSPACE_DIR="$STATE_DIR/workspace"
 export OPENCLAW_SKIP_FS_PERMISSION_CHECK=1
@@ -324,109 +383,147 @@ export GOG_HOME="$STATE_DIR/gog"
 
 mkdir -p "$STATE_DIR" "$STATE_DIR/workspace" "$STATE_DIR/gog"
 
-mount_r2() {
-	mountpoint -q "$R2_MOUNT" 2>/dev/null && fusermount -u "$R2_MOUNT" 2>/dev/null || true
-	rm -rf "$R2_MOUNT"
-	mkdir -p "$R2_MOUNT"
+BACKUP_DIRS="workspace credentials agents gog"
+# Live SQLite files must never be copied raw (torn mid-write copies) and WAL/SHM
+# sidecars from a different DB generation corrupt the DB on open. Consistent
+# copies travel via sqlite-snapshots/ (see backup_sqlite_snapshots).
+WAL_EXCLUDES=(--exclude '*.sqlite-wal' --exclude '*.sqlite-shm' --exclude '*.sqlite-journal')
+SQLITE_EXCLUDES=("${WAL_EXCLUDES[@]}" --exclude '*.sqlite')
 
-	if [ -z "$S3_ENDPOINT" ] || [ -z "$S3_BUCKET" ] || [ -z "$S3_ACCESS_KEY_ID" ] || [ -z "$S3_SECRET_ACCESS_KEY" ]; then
-		echo "[WARN] S3 not configured, no durable backup"
-		return 1
+# S3 credentials live in unexported RCLONE_S3_* shell vars (set at startup,
+# scrubbed from the environment before the gateway starts) and are passed
+# per-invocation so no child process inherits them.
+run_rclone() {
+	RCLONE_CONFIG_R2_TYPE=s3 \
+	RCLONE_CONFIG_R2_PROVIDER=Other \
+	RCLONE_CONFIG_R2_ENDPOINT="$RCLONE_S3_ENDPOINT" \
+	RCLONE_CONFIG_R2_ACCESS_KEY_ID="$RCLONE_S3_KEY" \
+	RCLONE_CONFIG_R2_SECRET_ACCESS_KEY="$RCLONE_S3_SECRET" \
+	RCLONE_CONFIG_R2_REGION="$RCLONE_S3_REGION" \
+	RCLONE_CONFIG_R2_FORCE_PATH_STYLE="$RCLONE_S3_PATH_STYLE" \
+	rclone --config /dev/null --timeout 60s --contimeout 15s --retries 2 --log-level ERROR "$@"
+}
+
+# Atomic snapshots of live SQLite DBs via sqlite3 .backup, staged locally and
+# uploaded with copy (not sync): a partially built staging tree must never
+# delete older good snapshots on the remote.
+backup_sqlite_snapshots() {
+	local staging=/tmp/sqlite-snapshots dir db rel
+	rm -rf "$staging"
+	for dir in $BACKUP_DIRS; do
+		[ -d "$STATE_DIR/$dir" ] || continue
+		while IFS= read -r -d '' db; do
+			rel="${db#"$STATE_DIR"/}"
+			mkdir -p "$staging/$(dirname "$rel")"
+			sqlite3 "$db" ".backup '$staging/$rel'" 2>/dev/null || true
+		done < <(find "$STATE_DIR/$dir" -name '*.sqlite' -type f -print0)
+	done
+	if [ -d "$staging" ]; then
+		run_rclone copy "$staging" "$REMOTE/sqlite-snapshots" || true
 	fi
-
-	export AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY_ID"
-	export AWS_SECRET_ACCESS_KEY="$S3_SECRET_ACCESS_KEY"
-	export AWS_REGION="${S3_REGION:-auto}"
-	export AWS_S3_PATH_STYLE="${S3_PATH_STYLE:-false}"
-
-	/usr/bin/tigrisfs \
-		--endpoint "$S3_ENDPOINT" \
-		--memory-limit 2048 \
-		--max-flushers 32 \
-		--stat-cache-ttl 15m \
-		${TIGRISFS_ARGS:-} \
-		-f "${S3_BUCKET}${S3_PREFIX:+:$S3_PREFIX}" "$R2_MOUNT" &
-	sleep 3
-
-	if ! mountpoint -q "$R2_MOUNT"; then
-		echo "[ERROR] R2 mount failed"
-		return 1
-	fi
-	echo "[OK] R2 mounted at $R2_MOUNT"
-	return 0
+	rm -rf "$staging"
 }
 
 restore_from_r2() {
 	echo "[INFO] Restoring state from R2..."
-	for dir in credentials workspace agents gog; do
-		if [ -d "$R2_MOUNT/$dir" ]; then
-			mkdir -p "$STATE_DIR/$dir"
-			rsync -a --exclude='openclaw.json' --exclude='openclaw.json.bak' "$R2_MOUNT/$dir/" "$STATE_DIR/$dir/" 2>/dev/null || true
+	local failed=0 dir
+	# Legacy migration: before sqlite-snapshots/ exists on the remote (first
+	# boot after the rclone switch), restore the rsync-era raw .sqlite files —
+	# losing all agent history is worse than a possibly-torn copy.
+	local have_snapshots=1
+	run_rclone lsf --max-depth 1 "$REMOTE/sqlite-snapshots" >/dev/null 2>&1 || have_snapshots=0
+	local -a excludes=("${WAL_EXCLUDES[@]}")
+	if [ "$have_snapshots" -eq 1 ]; then
+		excludes=("${SQLITE_EXCLUDES[@]}")
+	fi
+	for dir in $BACKUP_DIRS; do
+		# Absent remote dir (fresh bucket) is fine — not a restore failure
+		if ! run_rclone lsf --max-depth 1 "$REMOTE/$dir" >/dev/null 2>&1; then
+			echo "[INFO] No remote $dir to restore"
+			continue
+		fi
+		mkdir -p "$STATE_DIR/$dir"
+		if run_rclone copy "${excludes[@]}" --exclude 'openclaw.json' --exclude 'openclaw.json.bak' "$REMOTE/$dir" "$STATE_DIR/$dir"; then
 			echo "[INFO] Restored $dir"
+		else
+			echo "[WARN] Restore of $dir failed"
+			failed=1
 		fi
 	done
+	if [ "$have_snapshots" -eq 1 ]; then
+		run_rclone copy "$REMOTE/sqlite-snapshots" "$STATE_DIR" || failed=1
+	fi
+	if [ "$failed" -eq 0 ]; then
+		RESTORE_OK=true
+	else
+		echo "[WARN] Restore incomplete — backups run copy-only (no remote deletes)"
+	fi
+}
+
+do_backup() {
+	local dir
+	for dir in $BACKUP_DIRS; do
+		[ -d "$STATE_DIR/$dir" ] || continue
+		if [ "$RESTORE_OK" = "true" ]; then
+			# sync (remote deletes) is only safe after a proven-good restore;
+			# otherwise an empty/partial local dir would wipe the R2 backup
+			run_rclone sync "${SQLITE_EXCLUDES[@]}" "$STATE_DIR/$dir" "$REMOTE/$dir" || true
+		else
+			run_rclone copy "${SQLITE_EXCLUDES[@]}" "$STATE_DIR/$dir" "$REMOTE/$dir" || true
+		fi
+	done
+	backup_sqlite_snapshots
 }
 
 backup_to_r2() {
 	while true; do
 		sleep 300
-		if mountpoint -q "$R2_MOUNT" 2>/dev/null; then
-			for dir in workspace credentials agents gog; do
-				if [ -d "$STATE_DIR/$dir" ]; then
-					rsync -a --delete "$STATE_DIR/$dir/" "$R2_MOUNT/$dir/" 2>/dev/null || true
-				fi
-			done
-		fi
-	done
-}
-
-fuse_watchdog() {
-	while true; do
-		sleep 60
-		if [ "$R2_AVAILABLE" != "true" ]; then continue; fi
-		# Test FUSE mount with a timeout — if stat hangs, the mount is dead
-		if ! timeout 10 stat "$R2_MOUNT" >/dev/null 2>&1; then
-			echo "[WARN] FUSE mount hung, force-unmounting..."
-			# umount -l (lazy) detaches immediately even if FUSE is deadlocked;
-			# fusermount -u hangs on a deadlocked mount and makes things worse
-			umount -l "$R2_MOUNT" 2>/dev/null || true
-			killall -9 tigrisfs 2>/dev/null || true
-			sleep 2
-			if mount_r2; then
-				echo "[OK] FUSE remounted successfully"
-			else
-				echo "[ERROR] FUSE remount failed"
-				R2_AVAILABLE=false
-			fi
-		fi
+		do_backup
 	done
 }
 
 R2_AVAILABLE=false
-if mount_r2; then
-	R2_AVAILABLE=true
-	restore_from_r2
-	backup_to_r2 &
-	BACKUP_PID=$!
-	fuse_watchdog &
+RESTORE_OK=false
+BACKUP_PID=""
+if [ -n "$S3_ENDPOINT" ] && [ -n "$S3_BUCKET" ] && [ -n "$S3_ACCESS_KEY_ID" ] && [ -n "$S3_SECRET_ACCESS_KEY" ]; then
+	# Keep S3 credentials out of the gateway/bridge environment — the agent
+	# runs as root under the gateway and must not casually inherit storage
+	# credentials or storage plumbing (it previously wiped/hung on /r2).
+	# Root can still read /proc/1/environ; this closes the accidental path.
+	RCLONE_S3_ENDPOINT="$S3_ENDPOINT"
+	RCLONE_S3_KEY="$S3_ACCESS_KEY_ID"
+	RCLONE_S3_SECRET="$S3_SECRET_ACCESS_KEY"
+	RCLONE_S3_REGION="${S3_REGION:-auto}"
+	RCLONE_S3_PATH_STYLE="${S3_PATH_STYLE:-false}"
+	RCLONE_S3_BUCKET="$S3_BUCKET"
+	REMOTE="r2:${S3_BUCKET}${S3_PREFIX:+/$S3_PREFIX}"
+	unset S3_ENDPOINT S3_BUCKET S3_ACCESS_KEY_ID S3_SECRET_ACCESS_KEY S3_REGION S3_PATH_STYLE S3_PREFIX AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_REGION AWS_S3_PATH_STYLE
+
+	if run_rclone lsd "r2:$RCLONE_S3_BUCKET" >/dev/null 2>&1; then
+		R2_AVAILABLE=true
+		restore_from_r2
+		backup_to_r2 &
+		BACKUP_PID=$!
+	else
+		echo "[WARN] R2 bucket unreachable — no restore, no durable backup"
+	fi
+else
+	echo "[WARN] S3 not configured, no durable backup"
 fi
 
 cleanup() {
 	echo "[INFO] Shutting down..."
-	# Final backup
-	if [ "$R2_AVAILABLE" = "true" ] && mountpoint -q "$R2_MOUNT" 2>/dev/null; then
-		echo "[INFO] Final backup to R2..."
-		for dir in workspace credentials agents gog; do
-			[ -d "$STATE_DIR/$dir" ] && rsync -a --delete "$STATE_DIR/$dir/" "$R2_MOUNT/$dir/" 2>/dev/null || true
-		done
-	fi
-	[ -n "$BACKUP_PID" ] && kill "$BACKUP_PID" 2>/dev/null
-	[ -n "$CHAT_BRIDGE_PID" ] && kill "$CHAT_BRIDGE_PID" 2>/dev/null
+	[ -n "$BACKUP_PID" ] && kill "$BACKUP_PID" 2>/dev/null || true
+	[ -n "$CHAT_BRIDGE_PID" ] && kill "$CHAT_BRIDGE_PID" 2>/dev/null || true
+	# Stop the gateway first so SQLite quiesces before the final snapshot
 	if [ -n "$OPENCLAW_PID" ]; then
-		kill -TERM "$OPENCLAW_PID" 2>/dev/null
-		wait "$OPENCLAW_PID" 2>/dev/null
+		kill -TERM "$OPENCLAW_PID" 2>/dev/null || true
+		wait "$OPENCLAW_PID" 2>/dev/null || true
 	fi
-	mountpoint -q "$R2_MOUNT" 2>/dev/null && umount -l "$R2_MOUNT" 2>/dev/null || true
+	if [ "$R2_AVAILABLE" = "true" ]; then
+		echo "[INFO] Final backup to R2..."
+		do_backup
+	fi
 	exit 0
 }
 trap cleanup SIGTERM SIGINT
@@ -461,6 +558,9 @@ cat > "$OPENCLAW_STATE_DIR/openclaw.json" << EOFCONFIG
       "dangerouslyAllowHostHeaderOriginFallback": true,
       "dangerouslyDisableDeviceAuth": true
     }
+  },
+  "commands": {
+    "ownerAllowFrom": ["googlechat:users/109178430018179297743", "telegram:8667624550"]
   },
   "agents": {
     "defaults": {
@@ -529,6 +629,92 @@ EOFMEMORY
 echo "[INFO] MEMORY.md seeded in workspace"
 fi
 
+# Progress-updates instruction: appended once (marker-guarded) to the restored
+# workspace AGENTS.md. Google Chat has no live status edits like Telegram, so
+# the agent itself must narrate long tasks.
+if ! grep -q 'cloud-claw:progress-updates' "$OPENCLAW_WORKSPACE_DIR/AGENTS.md" 2>/dev/null; then
+cat >> "$OPENCLAW_WORKSPACE_DIR/AGENTS.md" << 'EOFPROGRESS'
+
+<!-- cloud-claw:progress-updates -->
+## Progress updates (operator instruction)
+
+Google Chat cannot show your working status, so narrate it yourself. For any
+task likely to take more than ~20 seconds (multiple tool calls, browsing,
+searches, file work):
+
+- Post a one-line message when you start, e.g. "On it — searching the docs...".
+- Post a short update after each significant step, roughly every 30 seconds of
+  work, e.g. "Found 3 candidates, checking each...".
+- Keep updates to a single short line. Never repeat a previous update.
+- Then send the actual answer as a normal final message.
+
+Do not do this for quick replies — only when real work is happening.
+EOFPROGRESS
+echo "[INFO] Progress-updates instruction appended to workspace AGENTS.md"
+fi
+
+# Lead-scout profile: seeded once, then owned and evolved by the agent
+# (R2-persisted, so it survives container restarts). history.md is created
+# lazily by the agent on the first scout run.
+mkdir -p "$OPENCLAW_WORKSPACE_DIR/leads"
+if [ ! -f "$OPENCLAW_WORKSPACE_DIR/leads/search-profile.md" ]; then
+cat > "$OPENCLAW_WORKSPACE_DIR/leads/search-profile.md" << 'EOFLEADS'
+# Lead search profile
+
+This file guides the daily lead scout. Update it whenever Greg or Liz give
+feedback on surfaced leads, and whenever a search strategy clearly works or
+fails. Keep it concise — it is read at the start of every scout run.
+
+## What we are looking for
+
+- Potential clients: organisations that could plausibly buy from us.
+- Sales opportunities: tenders, RFPs, procurement notices, relevant job
+  postings, funding/grant announcements, expansion news.
+- Derive specifics (industry, region, company size) from MEMORY.md and from
+  the feedback learnings below.
+
+## Search strategies that worked
+
+(none recorded yet)
+
+## Search strategies that did NOT work
+
+(none recorded yet)
+
+## Feedback learnings (newest first)
+
+(none recorded yet)
+EOFLEADS
+echo "[INFO] Lead search profile seeded"
+fi
+
+# Lead-feedback instruction: appended once (marker-guarded) to the workspace
+# AGENTS.md. Feedback on leads arrives as thread replies in normal chat
+# sessions, so every session must know to fold it back into the profile the
+# isolated cron scout reads.
+if ! grep -q 'cloud-claw:lead-feedback' "$OPENCLAW_WORKSPACE_DIR/AGENTS.md" 2>/dev/null; then
+cat >> "$OPENCLAW_WORKSPACE_DIR/AGENTS.md" << 'EOFLEADFB'
+
+<!-- cloud-claw:lead-feedback -->
+## Lead feedback capture (operator instruction)
+
+A daily "lead scout" cron job posts candidate leads to the QuickPoint space
+and keeps its strategy in leads/search-profile.md (history of surfaced leads
+in leads/history.md). Whenever Greg or Liz comment on a surfaced lead — a
+thread reply or any message like "good one", "not relevant", "more like #2",
+"we already know them":
+
+- Immediately record the verdict AND the reason why in the "Feedback
+  learnings (newest first)" section of leads/search-profile.md (one dated
+  bullet per lead).
+- If a pattern emerges (industry, region, lead type, source site), update the
+  "worked" / "did NOT work" strategy sections too.
+- Never rewrite or delete entries in leads/history.md — it is append-only.
+- Acknowledge briefly in chat; no long summaries.
+EOFLEADFB
+echo "[INFO] Lead-feedback instruction appended to workspace AGENTS.md"
+fi
+
 # Patch config with channels, plugins, and session settings
 node -e "
 const fs = require('fs');
@@ -552,21 +738,25 @@ if (fs.existsSync('$STATE_DIR/googlechat-sa.json')) {
     groupPolicy: 'open',
     groupAllowFrom: ['*'],
     replyToMode: 'all',
-    groups: { 'spaces/AAQAdFhXWNQ': { enabled: true, requireMention: false } }
+    groups: {
+      'spaces/AAQAdFhXWNQ': { enabled: true, requireMention: false },
+      'spaces/AAQAkEQWJXA': { enabled: true, requireMention: false }
+    }
   };
   console.log('[INFO] Google Chat channel configured');
 }
 
 // Telegram (if bot token is available)
 if (process.env.TELEGRAM_BOT_TOKEN) {
+  // Locked to Greg's Telegram user id (doctor flagged open DM/group policy)
   c.channels.telegram = {
     enabled: true,
     name: 'Quickly',
     botToken: process.env.TELEGRAM_BOT_TOKEN,
-    dmPolicy: 'open',
-    groupPolicy: 'open',
-    allowFrom: ['*'],
-    groupAllowFrom: ['*']
+    dmPolicy: 'allowlist',
+    groupPolicy: 'allowlist',
+    allowFrom: ['8667624550'],
+    groupAllowFrom: ['8667624550']
   };
   console.log('[INFO] Telegram channel configured');
 }
@@ -578,6 +768,7 @@ c.plugins = {
     browser: { enabled: true },
     googlechat: { enabled: true },
     telegram: { enabled: true },
+    duckduckgo: { enabled: true },
     'memory-core': {
       enabled: true,
       config: {
@@ -590,11 +781,31 @@ c.plugins = {
   },
 };
 
+// Web search for the daily lead scout (DuckDuckGo: free, no API key needed)
+c.tools = c.tools || {};
+c.tools.web = c.tools.web || {};
+c.tools.web.search = { enabled: true, provider: 'duckduckgo' };
+
 // Session
 c.session = { dmScope: 'per-channel-peer' };
 
 fs.writeFileSync(f, JSON.stringify(c, null, 2));
 "
+
+# GitHub skill (@steipete/github wraps the gh CLI, installed in the image).
+# Lands in the workspace skills dir (R2-backed), so this only runs on first
+# boot after the dir is gone. Standalone install — no gateway needed — and it
+# must run BEFORE gateway start because skills are loaded once at startup.
+# Non-fatal: a ClawHub outage must not block boot. Auth: gh reads GH_TOKEN
+# (fine-grained PAT scoped to the allowed private repo) from the environment;
+# no gh auth login required.
+if [ ! -d "$OPENCLAW_WORKSPACE_DIR/skills/github" ]; then
+	if openclaw skills install @steipete/github --acknowledge-clawhub-risk; then
+		echo "[INFO] Skill installed: @steipete/github"
+	else
+		echo "[WARN] Skill install failed: @steipete/github (will retry next boot)"
+	fi
+fi
 
 echo "[INFO] Starting OpenClaw Gateway..."
 echo "[INFO] Visit Web UI for initial setup on first use"
@@ -615,10 +826,95 @@ if [ -n "$GOOGLE_CHAT_SPACE" ]; then
 	echo "[INFO] Chat bridge started (PID $CHAT_BRIDGE_PID), polling $GOOGLE_CHAT_SPACE"
 fi
 
+# Scheduled gateway cron jobs: status reports (09:00 & 15:00 Europe/Dublin)
+# plus the daily lead scout (09:05). Jobs persist in state/openclaw.sqlite
+# (R2-backed); this block only creates missing ones, matched by --name. Runs
+# in the background because the CLI needs a healthy gateway. Worker cron
+# triggers (wrangler.jsonc triggers.crons) wake the container 5 minutes before
+# each individual gateway job's firing time — Cloudflare crons are UTC-only,
+# so both IST (+1) and GMT (+0) offsets are covered; the in-gateway scheduler
+# handles DST exactly via --tz. Re-derive the wake times with
+# `openclaw cron list --all --json` if gateway jobs change.
+setup_report_crons() {
+	for _ in $(seq 1 90); do
+		curl -sf http://localhost:6658/health >/dev/null 2>&1 && break
+		sleep 2
+	done
+	# The evening job was rescheduled to morning; drop the old persisted job if
+	# an earlier boot created it (cron rm needs the id, not the name).
+	stale_id=$(openclaw cron list --all --json 2>/dev/null |
+		node -p "try { (JSON.parse(require('fs').readFileSync(0,'utf8')).jobs ?? []).find(j => j.name === 'status-report-evening')?.id ?? '' } catch { '' }" 2>/dev/null) || stale_id=""
+	if [ -n "$stale_id" ]; then
+		if openclaw cron rm "$stale_id" >/dev/null 2>&1; then
+			echo "[INFO] Removed retired cron job: status-report-evening"
+		fi
+	fi
+	existing=$(openclaw cron list --all 2>/dev/null) || existing=""
+	report_prompt='Scheduled status report (runs 09:00 and 15:00 Europe/Dublin). Do these three things in order, sending each with the message tool on channel googlechat:
+
+1. Status DM for Greg -> spaces/ib7w3yAAAAE
+   Concise report for Gregory Kavanagh: new or important emails, open and due tasks, upcoming calendar items, and anything else notable since the last report. Use the gog CLI for Google data.
+
+2. Status DM for Liz -> spaces/k5sNMKAAAAE
+   Same for Liz Westendorf, covering her own email and tasks. If you cannot access her account data, say so in one line and include whatever is relevant to her from shared or team context instead.
+
+3. Project-manager update -> spaces/AAQAdFhXWNQ (QuickPoint team space)
+   Short PM-style update: progress since the last update, blockers or risks, and what is next. Under 10 lines.
+
+Formatting: Google Chat supports only basic markdown (*bold*, _italic_, lists). Keep each message short and scannable; never paste raw email bodies.
+
+When all three messages are sent, reply with exactly NO_REPLY. If any send fails, put that report in your final reply so fallback delivery posts it to the team space.'
+	for name in status-report-morning status-report-afternoon; do
+		case "$name" in
+		status-report-morning) expr="0 9 * * *" ;;
+		status-report-afternoon) expr="0 15 * * *" ;;
+		esac
+		if printf '%s' "$existing" | grep -q "$name"; then
+			continue
+		fi
+		if openclaw cron add --name "$name" --cron "$expr" --tz Europe/Dublin --exact \
+			--session isolated --message "$report_prompt" --timeout-seconds 600 \
+			--announce --channel googlechat --to "spaces/AAQAdFhXWNQ" --best-effort-deliver \
+			>/dev/null 2>&1; then
+			echo "[INFO] Cron job created: $name ($expr Europe/Dublin)"
+		else
+			echo "[WARN] Failed to create cron job: $name"
+		fi
+	done
+	lead_prompt='Daily lead scout (runs 09:05 Europe/Dublin). Find new business leads for Greg and Liz. Follow this procedure:
+
+1. Read leads/search-profile.md (strategy and feedback learnings) and leads/history.md (previously surfaced leads) in the workspace. If history.md does not exist yet, create it with a one-line header.
+
+2. Run 4-6 web_search queries guided by the profile: potential clients, plus sales opportunities such as tenders, RFPs, procurement notices, relevant job postings, and funding or expansion news. Vary at least one query as an experiment to learn what works. Verify promising results with web_fetch before recommending them.
+
+3. Pick the 3-5 best NEW leads. Skip anything already listed in leads/history.md.
+
+4. Post ONE message with the message tool on channel googlechat to spaces/AAQAdFhXWNQ: a numbered list where each item has the lead name, a one-line reason it matters, and a link. End the message by asking Greg and Liz to reply in the thread with quick feedback (good / not relevant / more like N).
+
+5. Append this run to leads/history.md (the date, the queries used, the leads surfaced) and update leads/search-profile.md with anything learned. History is append-only — never rewrite old entries.
+
+If nothing genuinely new or promising turns up, do not post filler: skip the chat message but still log the attempt and queries in leads/history.md so the next run avoids them.
+
+Formatting: Google Chat supports only basic markdown (*bold*, _italic_, lists). Keep it short and scannable.
+
+When done, reply with exactly NO_REPLY. If the send fails, put the lead list in your final reply so fallback delivery posts it to the team space.'
+	if ! printf '%s' "$existing" | grep -q "lead-scout"; then
+		if openclaw cron add --name "lead-scout" --cron "5 9 * * *" --tz Europe/Dublin --exact \
+			--session isolated --message "$lead_prompt" --timeout-seconds 900 \
+			--announce --channel googlechat --to "spaces/AAQAdFhXWNQ" --best-effort-deliver \
+			>/dev/null 2>&1; then
+			echo "[INFO] Cron job created: lead-scout (5 9 * * * Europe/Dublin)"
+		else
+			echo "[WARN] Failed to create cron job: lead-scout"
+		fi
+	fi
+}
+setup_report_crons &
+
 wait $OPENCLAW_PID
 EOF
 
-LABEL cloud-claw.version="v2-no-operator-ws"
+LABEL cloud-claw.version="v3-rclone-operator-ws"
 
 WORKDIR /data/workspace
 EXPOSE 6658
