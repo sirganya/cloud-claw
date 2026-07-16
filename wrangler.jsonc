@@ -27,6 +27,9 @@
       "name": "cloud-claw-container",
       "class_name": "AgentContainer",
       "image": "./Dockerfile",
+      "ssh": {
+        "enabled": true,
+      },
       "instance_type": {
         "vcpu": 1,
         "memory_mib": 4096,
@@ -36,6 +39,12 @@
       "constraints": {
         "region": ["wnam"],
       },
+      "authorized_keys": [
+        {
+          "name": "greg",
+          "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIO7Gje16pyIJEIGX40h07uTIh837IS60ZraDLn7NZcNe greg@MacBook-Air.local",
+        },
+      ],
     },
   ],
   "durable_objects": {
@@ -46,11 +55,13 @@
       },
     ],
   },
-  // Wake container at 8am Irish time (7am UTC year-round close enough;
-  // IST is UTC+1 in summer so this fires at 8am in winter, 8am in summer
-  // only if we use Europe/Dublin — but cron uses UTC, so 7am UTC = 8am IST)
+  // Wake container before scheduled in-gateway work (Cloudflare crons are UTC-only):
+  // - 02:50 nightly dream sweep (dreaming runs at 03:00 UTC)
+  // - 07:55/08:55 + 13:55/14:55 status reports at 09:00/15:00 Europe/Dublin,
+  //   covering both IST (UTC+1) and GMT (UTC+0); the tz-aware gateway cron
+  //   fires at the exact local time, spurious wakes just idle ~10 min.
   "triggers": {
-    "crons": ["0 7 * * *"],
+    "crons": ["55 2,7,8,13 * * *"],
   },
   "migrations": [
     {
