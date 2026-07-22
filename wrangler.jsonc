@@ -64,10 +64,10 @@
   //   - status-report-morning      0 9 * * *      Europe/Dublin  -> 07:55 / 08:55
   //   - lead-scout                 5 9 * * *      Europe/Dublin  -> 08:00 / 09:00
   //   - daily-standup              15 9 * * 1-5   Europe/Dublin  -> 08:10 / 09:10
-  //   - status-report-afternoon    0 15 * * *     Europe/Dublin  -> 13:55 / 14:55
+  // status-report-afternoon removed 2026-07-22 (broken gmail lookup, duplicate noise).
   // Re-derive this list with `openclaw cron list --all --json` if gateway jobs change.
   "triggers": {
-    "crons": ["55 2,7,8,13,14 * * *", "0 8,9 * * *", "10 8,9 * * *"],
+    "crons": ["55 2,7,8 * * *", "0 8,9 * * *", "10 8,9 * * *"],
   },
   "migrations": [
     {
