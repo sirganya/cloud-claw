@@ -562,11 +562,15 @@ cat > "$OPENCLAW_STATE_DIR/openclaw.json" << EOFCONFIG
   "commands": {
     "ownerAllowFrom": ["googlechat:users/109178430018179297743", "telegram:8667624550"]
   },
+  "cron": {
+    "enabled": false
+  },
   "agents": {
     "defaults": {
       "model": {
         "primary": "google/gemini-3.5-flash"
       },
+      "contextTokens": 131072,
       "memorySearch": {
         "enabled": true,
         "provider": "gemini"
@@ -653,66 +657,13 @@ EOFPROGRESS
 echo "[INFO] Progress-updates instruction appended to workspace AGENTS.md"
 fi
 
-# Lead-scout profile: seeded once, then owned and evolved by the agent
-# (R2-persisted, so it survives container restarts). history.md is created
-# lazily by the agent on the first scout run.
-mkdir -p "$OPENCLAW_WORKSPACE_DIR/leads"
-if [ ! -f "$OPENCLAW_WORKSPACE_DIR/leads/search-profile.md" ]; then
-cat > "$OPENCLAW_WORKSPACE_DIR/leads/search-profile.md" << 'EOFLEADS'
-# Lead search profile
-
-This file guides the daily lead scout. Update it whenever Greg or Liz give
-feedback on surfaced leads, and whenever a search strategy clearly works or
-fails. Keep it concise — it is read at the start of every scout run.
-
-## What we are looking for
-
-- Potential clients: organisations that could plausibly buy from us.
-- Sales opportunities: tenders, RFPs, procurement notices, relevant job
-  postings, funding/grant announcements, expansion news.
-- Derive specifics (industry, region, company size) from MEMORY.md and from
-  the feedback learnings below.
-
-## Search strategies that worked
-
-(none recorded yet)
-
-## Search strategies that did NOT work
-
-(none recorded yet)
-
-## Feedback learnings (newest first)
-
-(none recorded yet)
-EOFLEADS
-echo "[INFO] Lead search profile seeded"
-fi
-
-# Lead-feedback instruction: appended once (marker-guarded) to the workspace
-# AGENTS.md. Feedback on leads arrives as thread replies in normal chat
-# sessions, so every session must know to fold it back into the profile the
-# isolated cron scout reads.
-if ! grep -q 'cloud-claw:lead-feedback' "$OPENCLAW_WORKSPACE_DIR/AGENTS.md" 2>/dev/null; then
-cat >> "$OPENCLAW_WORKSPACE_DIR/AGENTS.md" << 'EOFLEADFB'
-
-<!-- cloud-claw:lead-feedback -->
-## Lead feedback capture (operator instruction)
-
-A daily "lead scout" cron job posts candidate leads to the QuickPoint space
-and keeps its strategy in leads/search-profile.md (history of surfaced leads
-in leads/history.md). Whenever Greg or Liz comment on a surfaced lead — a
-thread reply or any message like "good one", "not relevant", "more like #2",
-"we already know them":
-
-- Immediately record the verdict AND the reason why in the "Feedback
-  learnings (newest first)" section of leads/search-profile.md (one dated
-  bullet per lead).
-- If a pattern emerges (industry, region, lead type, source site), update the
-  "worked" / "did NOT work" strategy sections too.
-- Never rewrite or delete entries in leads/history.md — it is append-only.
-- Acknowledge briefly in chat; no long summaries.
-EOFLEADFB
-echo "[INFO] Lead-feedback instruction appended to workspace AGENTS.md"
+# Lead-scout workspace seeding and the AGENTS.md lead-feedback instruction
+# were removed 2026-08-02 along with the lead-scout cron (Gemini cost cleanup).
+# The stale <!-- cloud-claw:lead-feedback --> block is stripped from the
+# R2-persisted AGENTS.md here so it stops inflating every run's context.
+if grep -q 'cloud-claw:lead-feedback' "$OPENCLAW_WORKSPACE_DIR/AGENTS.md" 2>/dev/null; then
+	sed -i '/<!-- cloud-claw:lead-feedback -->/,/^- Acknowledge briefly in chat; no long summaries\.$/d' "$OPENCLAW_WORKSPACE_DIR/AGENTS.md"
+	echo "[INFO] Stale lead-feedback instruction stripped from workspace AGENTS.md"
 fi
 
 # Patch config with channels, plugins, and session settings
@@ -773,7 +724,7 @@ c.plugins = {
       enabled: true,
       config: {
         dreaming: {
-          enabled: true,
+          enabled: false,
           timezone: 'UTC',
         },
       },
@@ -826,90 +777,18 @@ if [ -n "$GOOGLE_CHAT_SPACE" ]; then
 	echo "[INFO] Chat bridge started (PID $CHAT_BRIDGE_PID), polling $GOOGLE_CHAT_SPACE"
 fi
 
-# Scheduled gateway cron jobs: status reports (09:00 & 15:00 Europe/Dublin)
-# plus the daily lead scout (09:05). Jobs persist in state/openclaw.sqlite
-# (R2-backed); this block only creates missing ones, matched by --name. Runs
-# in the background because the CLI needs a healthy gateway. Worker cron
-# triggers (wrangler.jsonc triggers.crons) wake the container 5 minutes before
-# each individual gateway job's firing time — Cloudflare crons are UTC-only,
-# so both IST (+1) and GMT (+0) offsets are covered; the in-gateway scheduler
-# handles DST exactly via --tz. Re-derive the wake times with
-# `openclaw cron list --all --json` if gateway jobs change.
-setup_report_crons() {
-	for _ in $(seq 1 90); do
-		curl -sf http://localhost:6658/health >/dev/null 2>&1 && break
-		sleep 2
-	done
-	# The evening job was rescheduled to morning; drop the old persisted job if
-	# an earlier boot created it (cron rm needs the id, not the name).
-	stale_id=$(openclaw cron list --all --json 2>/dev/null |
-		node -p "try { (JSON.parse(require('fs').readFileSync(0,'utf8')).jobs ?? []).find(j => j.name === 'status-report-evening')?.id ?? '' } catch { '' }" 2>/dev/null) || stale_id=""
-	if [ -n "$stale_id" ]; then
-		if openclaw cron rm "$stale_id" >/dev/null 2>&1; then
-			echo "[INFO] Removed retired cron job: status-report-evening"
-		fi
-	fi
-	existing=$(openclaw cron list --all 2>/dev/null) || existing=""
-	report_prompt='Scheduled status report (runs 09:00 and 15:00 Europe/Dublin). Do these three things in order, sending each with the message tool on channel googlechat:
-
-1. Status DM for Greg -> spaces/ib7w3yAAAAE
-   Concise report for Gregory Kavanagh: new or important emails, open and due tasks, upcoming calendar items, and anything else notable since the last report. Use the gog CLI for Google data.
-
-2. Status DM for Liz -> spaces/k5sNMKAAAAE
-   Same for Liz Westendorf, covering her own email and tasks. If you cannot access her account data, say so in one line and include whatever is relevant to her from shared or team context instead.
-
-3. Project-manager update -> spaces/AAQAdFhXWNQ (QuickPoint team space)
-   Short PM-style update: progress since the last update, blockers or risks, and what is next. Under 10 lines.
-
-Formatting: Google Chat supports only basic markdown (*bold*, _italic_, lists). Keep each message short and scannable; never paste raw email bodies.
-
-When all three messages are sent, reply with exactly NO_REPLY. If any send fails, put that report in your final reply so fallback delivery posts it to the team space.'
-	for name in status-report-morning status-report-afternoon; do
-		case "$name" in
-		status-report-morning) expr="0 9 * * *" ;;
-		status-report-afternoon) expr="0 15 * * *" ;;
-		esac
-		if printf '%s' "$existing" | grep -q "$name"; then
-			continue
-		fi
-		if openclaw cron add --name "$name" --cron "$expr" --tz Europe/Dublin --exact \
-			--session isolated --message "$report_prompt" --timeout-seconds 600 \
-			--announce --channel googlechat --to "spaces/AAQAdFhXWNQ" --best-effort-deliver \
-			>/dev/null 2>&1; then
-			echo "[INFO] Cron job created: $name ($expr Europe/Dublin)"
-		else
-			echo "[WARN] Failed to create cron job: $name"
-		fi
-	done
-	lead_prompt='Daily lead scout (runs 09:05 Europe/Dublin). Find new business leads for Greg and Liz. Follow this procedure:
-
-1. Read leads/search-profile.md (strategy and feedback learnings) and leads/history.md (previously surfaced leads) in the workspace. If history.md does not exist yet, create it with a one-line header.
-
-2. Run 4-6 web_search queries guided by the profile: potential clients, plus sales opportunities such as tenders, RFPs, procurement notices, relevant job postings, and funding or expansion news. Vary at least one query as an experiment to learn what works. Verify promising results with web_fetch before recommending them.
-
-3. Pick the 3-5 best NEW leads. Skip anything already listed in leads/history.md.
-
-4. Post ONE message with the message tool on channel googlechat to spaces/AAQAdFhXWNQ: a numbered list where each item has the lead name, a one-line reason it matters, and a link. End the message by asking Greg and Liz to reply in the thread with quick feedback (good / not relevant / more like N).
-
-5. Append this run to leads/history.md (the date, the queries used, the leads surfaced) and update leads/search-profile.md with anything learned. History is append-only — never rewrite old entries.
-
-If nothing genuinely new or promising turns up, do not post filler: skip the chat message but still log the attempt and queries in leads/history.md so the next run avoids them.
-
-Formatting: Google Chat supports only basic markdown (*bold*, _italic_, lists). Keep it short and scannable.
-
-When done, reply with exactly NO_REPLY. If the send fails, put the lead list in your final reply so fallback delivery posts it to the team space.'
-	if ! printf '%s' "$existing" | grep -q "lead-scout"; then
-		if openclaw cron add --name "lead-scout" --cron "5 9 * * *" --tz Europe/Dublin --exact \
-			--session isolated --message "$lead_prompt" --timeout-seconds 900 \
-			--announce --channel googlechat --to "spaces/AAQAdFhXWNQ" --best-effort-deliver \
-			>/dev/null 2>&1; then
-			echo "[INFO] Cron job created: lead-scout (5 9 * * * Europe/Dublin)"
-		else
-			echo "[WARN] Failed to create cron job: lead-scout"
-		fi
-	fi
-}
-setup_report_crons &
+# Status reports and daily standup were removed 2026-07-29 (unwanted chat
+# noise) and are NOT recreated here; the standup is now run on demand by
+# asking the agent, using its project-manager skill. memory-core's
+# dreaming.enabled flag (see plugins config above) is off so it no longer
+# self-heals its own "Memory Dreaming Promotion" job. Do not reintroduce
+# automatic cron creation for those without explicit confirmation.
+#
+#
+# lead-scout was disabled 2026-08-02 (Gemini cost cleanup): the creation
+# block was removed and cron.enabled=false is set in the config template.
+# The old job row may persist in state/openclaw.sqlite but never runs.
+# Do not reintroduce it without explicit confirmation.
 
 wait $OPENCLAW_PID
 EOF

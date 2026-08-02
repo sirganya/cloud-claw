@@ -123,17 +123,17 @@ const res = await browser.fetch('http://cloudflare.browser/v1/acquire')
 
 ## Environment Variables
 
-| Variable                 | Purpose                                     |
-| ------------------------ | ------------------------------------------- |
-| `SERVER_USERNAME`        | Basic auth username                         |
-| `SERVER_PASSWORD`        | Basic auth password (empty = auth disabled) |
-| `OPENCLAW_GATEWAY_TOKEN` | Gateway access token                        |
-| `WORKER_URL`             | Worker's public URL (for CDP proxy config)  |
-| `S3_ENDPOINT`            | S3-compatible storage endpoint              |
-| `S3_BUCKET`              | S3 bucket name                              |
-| `S3_ACCESS_KEY_ID`       | S3 access key                               |
-| `S3_SECRET_ACCESS_KEY`   | S3 secret key                               |
-| `S3_PREFIX`              | S3 key prefix (optional)                    |
+| Variable                 | Purpose                                                                              |
+| ------------------------ | ------------------------------------------------------------------------------------ |
+| `SERVER_USERNAME`        | Basic auth username                                                                  |
+| `SERVER_PASSWORD`        | Basic auth password (empty = auth disabled)                                          |
+| `OPENCLAW_GATEWAY_TOKEN` | Gateway access token                                                                 |
+| `WORKER_URL`             | Worker's public URL (for CDP proxy config)                                           |
+| `S3_ENDPOINT`            | S3-compatible storage endpoint                                                       |
+| `S3_BUCKET`              | S3 bucket name                                                                       |
+| `S3_ACCESS_KEY_ID`       | S3 access key                                                                        |
+| `S3_SECRET_ACCESS_KEY`   | S3 secret key                                                                        |
+| `S3_PREFIX`              | S3 key prefix (optional)                                                             |
 | `GH_TOKEN`               | GitHub fine-grained PAT for the `gh` CLI (GitHub skill; scope to allowed repos only) |
 
 **Bindings** (in `wrangler.jsonc`):
@@ -244,6 +244,7 @@ The bridge (`chat-bridge.mjs`) supports multiple spaces natively: it splits
 (`lastCreateTime`) and resolved space object, isolated in a `Map` keyed by space
 name — one space's poll/forward failure never affects another's. Adding a space
 requires **both**:
+
 1. Adding it to `GOOGLE_CHAT_SPACE` (comma-separated) — covers non-mention polling
 2. Adding it to `channels.googlechat.groups` in the entrypoint config — covers the
    direct @mention webhook path
@@ -368,60 +369,29 @@ is **ignored** by Cloudflare Containers:
   container is running — probing would wake a sleeper) destroys and restarts
   the container after 3 consecutive failures.
 
-### Scheduled status reports (cron)
+### Scheduled status reports (removed 2026-07-29)
 
-Two OpenClaw cron jobs (`status-report-morning`, `status-report-afternoon`)
-run at **09:00 and 15:00 Europe/Dublin** in an isolated session. Each compiles
-email/task status and sends three Google Chat messages via the `message` tool:
+The `status-report-morning`/`status-report-afternoon` cron jobs (09:00/15:00
+Europe/Dublin DMs + team-space update) were removed 2026-07-29 as unwanted
+chat noise; a standup is now run on demand by asking the agent. The chat
+bridge's `inQuietWakeWindow` still references their old wake windows so
+automated boots near those times stay silent — harmless leftover.
 
-- DM to Greg (`spaces/ib7w3yAAAAE`)
-- DM to Liz (`spaces/k5sNMKAAAAE`) — her own email/tasks, degrades to a note
-  if her account data is not accessible
-- PM-style update to the QuickPoint team space (`spaces/AAQAdFhXWNQ`), which
-  is also the `--announce` fallback target if the agent fails to send
+### Lead scout (removed 2026-08-02)
 
-Wiring:
-
-- Jobs are created idempotently by `setup_report_crons` in `entrypoint.sh`
-  (background: waits for gateway health, checks `openclaw cron list --all` by
-  name, then `openclaw cron add --cron ... --tz Europe/Dublin --exact`). They
-  persist in `state/openclaw.sqlite`, so they survive restarts via R2 backup.
-- Cloudflare cron triggers are UTC-only (no DST), so `wrangler.jsonc` wakes
-  the container at `55 7,8,13,14 * * *` UTC — 5 minutes before every
-  possible IST/GMT firing time. The in-gateway scheduler (tz-aware) fires at
-  the exact local time; the two spurious wakes per day just idle ~10 minutes.
-- A retired `status-report-evening` (21:00) job is removed on boot if a
-  previous deployment persisted it.
-- The chat bridge's wake notice is suppressed in narrow windows around these
-  wakes (`inQuietWakeWindow`) so automated boots do not post "Waking up".
-
-### Lead scout (daily cron)
-
-A third gateway cron job, `lead-scout`, runs at **09:05 Europe/Dublin**
-(isolated session) and searches the web for potential clients and sales
-opportunities (tenders, RFPs, job postings, funding news). It posts the 3–5
-best new leads as one numbered message to the QuickPoint team space and asks
-Greg/Liz for thread-reply feedback. No new Worker wake is needed: the 09:00
-status report's activity renews the 10-minute sleep timer through 09:05.
-
-- **Search stack**: built-in `web_search` tool via the free DuckDuckGo
-  provider (no API key). Enabled in the entrypoint config patch:
-  `plugins.entries.duckduckgo` + `tools.web.search = { enabled, provider:
-  'duckduckgo' }`. `web_fetch` (always available) verifies results.
-- **Learning loop** (all files R2-persisted in the workspace):
-  - `leads/search-profile.md` — strategy + feedback learnings. Seeded once by
-    the entrypoint; owned/evolved by the agent afterwards.
-  - `leads/history.md` — append-only log of every run (date, queries, leads)
-    used for dedupe; created by the agent on first run.
-  - Feedback arrives as thread replies in normal chat sessions (the bridge
-    forwards them), so a marker-guarded workspace AGENTS.md instruction
-    (`cloud-claw:lead-feedback`) tells every session to record verdicts and
-    reasons into the profile the cron scout reads next morning.
-- On days with nothing new the scout skips the chat message but still logs
-  the attempted queries.
-- Job creation is idempotent in `setup_report_crons` (same pattern as the
-  status reports, `--timeout-seconds 900`, announce fallback to the team
-  space).
+The `lead-scout` daily cron (09:05 Europe/Dublin, isolated session, web
+search for potential clients/tenders posted to the leads space) was disabled
+2026-08-02 as part of the Gemini cost cleanup: at ~$0.50 per agent run it was
+a major contributor to a ~$376/month Gemini bill. The gateway cron scheduler
+is now off entirely (`cron.enabled: false` in the entrypoint config — it was
+the only remaining job), the entrypoint creation/seeding blocks were removed,
+the stale `cloud-claw:lead-feedback` workspace AGENTS.md instruction is
+stripped at boot, and the Worker wake crons that existed solely for it are
+gone (`triggers.crons` is empty). The old job row may persist in
+`state/openclaw.sqlite` but never runs. `leads/*` workspace files remain in
+R2 as history. The DuckDuckGo `web_search` plugin stays enabled — it is free
+and generally useful. Do not reintroduce the cron without explicit
+confirmation.
 
 ### GitHub skill (@steipete/github)
 

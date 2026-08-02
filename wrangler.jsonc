@@ -55,19 +55,13 @@
       },
     ],
   },
-  // Wake container 5 min before every in-gateway cron job (Cloudflare crons are
-  // UTC-only; the tz-aware gateway cron fires at the exact local time). Each
-  // Europe/Dublin job needs two wakes — IST (UTC+1) and GMT (UTC+0) — since
-  // Cloudflare crons don't observe DST; the spurious wake in the other season
-  // just idles ~10 min via sleepAfter. Sourced from `openclaw cron list --all`:
-  //   - Memory Dreaming Promotion   0 3 * * *      UTC            -> 02:55
-  //   - status-report-morning      0 9 * * *      Europe/Dublin  -> 07:55 / 08:55
-  //   - lead-scout                 5 9 * * *      Europe/Dublin  -> 08:00 / 09:00
-  //   - daily-standup              15 9 * * 1-5   Europe/Dublin  -> 08:10 / 09:10
-  // status-report-afternoon removed 2026-07-22 (broken gmail lookup, duplicate noise).
-  // Re-derive this list with `openclaw cron list --all --json` if gateway jobs change.
+  // Status reports, daily standup, and memory dreaming were removed
+  // 2026-07-29 (unwanted chat noise), and lead-scout was disabled 2026-08-02
+  // (Gemini cost cleanup) — see Dockerfile entrypoint. No gateway cron jobs
+  // remain, so there is nothing to wake the container for; crons stays empty
+  // (the scheduled handler in src/index.ts is inert without a trigger).
   "triggers": {
-    "crons": ["55 2,7,8 * * *", "0 8,9 * * *", "10 8,9 * * *"],
+    "crons": [],
   },
   "migrations": [
     {
