@@ -422,3 +422,30 @@ wrangler containers ssh <INSTANCE_ID>
 The SSH key is declared in `wrangler.jsonc` under `authorized_keys`. If SSH
 fails with permission denied after a fresh deploy, wait for the container to
 fully start and retry.
+
+## STATUS.md — keep it updated
+
+`STATUS.md` at the repo root is a plain-English status briefing for Greg, who runs many AI-assisted projects in parallel and reads these files (via a dashboard) to keep track of what's happening in each one. Write it for a human catching up after a week away — synthesized prose, never pasted commit messages.
+
+**If you make meaningful changes in this repo, update STATUS.md before you finish.** Refresh the date line and keep this exact section order (the dashboard shows the first three sections up front and collapses the rest):
+
+```
+# <repo> — Status
+_Updated YYYY-MM-DD by <agent>_
+
+**Last done:**
+- <2-4 bullets: most recent completed work>
+
+**Next planned:**
+- <1-3 bullets: what's queued or logically next>
+
+**Needs from Greg:** <ONLY things an agent can't do alone — decisions, approvals, git pushes, credentials, money, manual testing. "Nothing" if none.>
+
+**What it is:** <one sentence>
+
+**Current focus:** <1-2 sentences>
+
+**In flight (uncommitted):** <what uncommitted work is about, or "Nothing — clean tree.">
+```
+
+Keep the whole file under 30 lines.
