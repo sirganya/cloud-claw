@@ -570,7 +570,16 @@ cat > "$OPENCLAW_STATE_DIR/openclaw.json" << EOFCONFIG
       "model": {
         "primary": "google/gemini-3.5-flash"
       },
-      "contextTokens": 131072,
+      "contextTokens": 65536,
+      "contextPruning": {
+        "mode": "cache-ttl",
+        "ttl": "5m"
+      },
+      "compaction": {
+        "midTurnPrecheck": { "enabled": true },
+        "maxActiveTranscriptBytes": 524288,
+        "truncateAfterCompaction": true
+      },
       "memorySearch": {
         "enabled": true,
         "provider": "gemini"
