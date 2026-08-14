@@ -576,9 +576,7 @@ cat > "$OPENCLAW_STATE_DIR/openclaw.json" << EOFCONFIG
         "ttl": "5m"
       },
       "compaction": {
-        "midTurnPrecheck": { "enabled": true },
-        "maxActiveTranscriptBytes": 524288,
-        "truncateAfterCompaction": true
+        "midTurnPrecheck": { "enabled": true }
       },
       "memorySearch": {
         "enabled": true,
@@ -673,6 +671,35 @@ fi
 if grep -q 'cloud-claw:lead-feedback' "$OPENCLAW_WORKSPACE_DIR/AGENTS.md" 2>/dev/null; then
 	sed -i '/<!-- cloud-claw:lead-feedback -->/,/^- Acknowledge briefly in chat; no long summaries\.$/d' "$OPENCLAW_WORKSPACE_DIR/AGENTS.md"
 	echo "[INFO] Stale lead-feedback instruction stripped from workspace AGENTS.md"
+fi
+
+# Exec hygiene: the biggest driver of Gemini cost is the agent inlining full
+# datasets and secrets into exec/node script args and dumping huge greps — this
+# gets re-sent in the transcript every turn (~170k tokens/turn observed). This
+# is behavioral, not config; midTurnPrecheck only trims tool *results*, not the
+# inlined *args*. Marker-guarded so it appends once.
+if ! grep -q 'cloud-claw:exec-hygiene' "$OPENCLAW_WORKSPACE_DIR/AGENTS.md" 2>/dev/null; then
+cat >> "$OPENCLAW_WORKSPACE_DIR/AGENTS.md" << 'EOFEXEC'
+
+<!-- cloud-claw:exec-hygiene -->
+## Exec hygiene (operator instruction — keeps context small)
+
+Everything you put in an `exec`/shell/node argument is kept in the transcript
+and re-sent to the model on every following turn. Large args make each turn
+progressively slower and more expensive. So:
+
+- NEVER inline a dataset (JSON, CSV, query results, file contents) into a
+  script or command. Write it to a file first, then have the script read the
+  file. Pass the path, not the data.
+- NEVER inline secrets (Notion token, API keys) into scripts. Read them from
+  environment variables at runtime, e.g. `process.env.NOTION_TOKEN`.
+- Scope your searches. Never `grep`/`cat`/`ls -R` an entire large workspace and
+  dump the output — target the specific files or directories you need, and use
+  head/limits so results stay small.
+- Prefer writing a reusable script to a file and running it by path over pasting
+  long one-liners inline.
+EOFEXEC
+echo "[INFO] Exec-hygiene instruction appended to workspace AGENTS.md"
 fi
 
 # Patch config with channels, plugins, and session settings
