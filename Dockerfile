@@ -221,47 +221,6 @@ async function resolveSpace(name) {
   console.error('[chat-bridge]', name, 'Using fallback space object (spaceType=SPACE)')
 }
 
-// Wake-up notice: the bridge starts once per container boot, so this fires on
-// every cold start. Cold starts are slow (R2 restore + gateway load + agent
-// boot) — post a short note so the user isn't staring at "is typing" silence.
-// Skipped during automated wakes (nobody is waiting on a reply) and when the
-// gateway is already healthy (bridge-only restart).
-function inQuietWakeWindow() {
-  const now = new Date()
-  const h = now.getUTCHours(), m = now.getUTCMinutes()
-  // Nightly dream wake (Worker cron 02:50 UTC; dreaming runs until ~04:35)
-  if ((h === 2 && m >= 45) || h === 3 || (h === 4 && m <= 35)) return true
-  // Status-report wakes: Worker cron fires at 07:55/08:55/13:55/14:55 UTC so
-  // the 09:00/15:00 Europe/Dublin jobs can run across DST. A boot within a few
-  // minutes of those wakes is automated; user-triggered boots outside these
-  // narrow windows still get the notice.
-  if (m >= 50 && [7, 8, 13, 14].includes(h)) return true
-  if (m <= 10 && [8, 9, 14, 15].includes(h)) return true
-  return false
-}
-
-async function announceWake() {
-  if (inQuietWakeWindow()) return
-  try {
-    const r = await fetch(`http://localhost:${PORT}/health`, { signal: AbortSignal.timeout(1_000) })
-    if (r.ok) return // gateway already up — not a cold start
-  } catch {}
-  for (const name of SPACES) {
-    try {
-      const t = await appToken()
-      const r = await fetch(`https://chat.googleapis.com/v1/${name}/messages`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${t}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: '_Waking up — loading memory, back with you shortly..._' }),
-      })
-      if (!r.ok) console.error('[chat-bridge]', name, 'Wake notice failed', r.status, oneLine(await r.text().catch(() => '')))
-      else console.log('[chat-bridge]', name, 'Wake notice posted')
-    } catch (e) {
-      console.error('[chat-bridge]', name, 'Wake notice error:', e.message)
-    }
-  }
-}
-
 // Only skip messages that @mention the BOT — those arrive via the direct
 // Google webhook and would be processed twice. Mentions of other users must
 // still be forwarded.
@@ -357,7 +316,6 @@ async function pollOnce() {
   }
 }
 
-await announceWake()
 console.log('[chat-bridge] Waiting for gateway...')
 await waitForGateway()
 await Promise.all(SPACES.map(resolveSpace))
