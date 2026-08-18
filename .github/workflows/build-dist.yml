@@ -1,9 +1,17 @@
 name: Build OpenClaw Dist
 
+# Builds a full vendored OpenClaw tree (dist + node_modules + extensions +
+# packages + dist-runtime) for a pinned ref and uploads it as one artifact.
+# Download it, extract over openclaw-build/, re-verify the Dockerfile sed
+# patches, then `pnpm run deploy`. Dispatch-only — the heavy tsdown/UI build
+# runs here (6GB heap) because local machines lack the RAM.
 on:
-  push:
-    branches: [main, master]
   workflow_dispatch:
+    inputs:
+      openclaw_ref:
+        description: OpenClaw git ref (tag or branch) to build
+        required: true
+        default: v2026.8.1-beta.2
 
 jobs:
   build-dist:
@@ -22,9 +30,12 @@ jobs:
       - name: Install pnpm
         run: corepack enable && corepack prepare pnpm@10.28.2 --activate
 
-      - name: Clone OpenClaw (main repo)
+      - name: Clone OpenClaw
+        env:
+          OPENCLAW_REF: ${{ inputs.openclaw_ref }}
         run: |
-          git clone --depth 1 https://github.com/openclaw/openclaw.git openclaw-dist
+          git clone --depth 1 --branch "$OPENCLAW_REF" \
+            https://github.com/openclaw/openclaw.git openclaw-dist
 
       - name: Configure pnpm
         working-directory: openclaw-dist
@@ -37,14 +48,38 @@ jobs:
         run: pnpm install --frozen-lockfile
         timeout-minutes: 30
 
-      - name: Build (ciArtifacts profile - minimal)
+      - name: Build (ciArtifacts profile)
         working-directory: openclaw-dist
         run: NODE_OPTIONS=--max-old-space-size=6144 pnpm build ciArtifacts
         timeout-minutes: 120
 
-      - name: Upload dist artifact
+      - name: Record build metadata
+        working-directory: openclaw-dist
+        env:
+          OPENCLAW_REF: ${{ inputs.openclaw_ref }}
+        run: |
+          {
+            echo "ref=$OPENCLAW_REF"
+            echo "commit=$(git rev-parse HEAD)"
+            echo "version=$(node -p "require('./package.json').version")"
+          } | tee BUILD_META.txt
+
+      - name: Sanity-check the pieces the Dockerfile copies
+        working-directory: openclaw-dist
+        run: |
+          for p in dist dist-runtime extensions packages node_modules/openclaw \
+                   package.json pnpm-workspace.yaml openclaw.mjs docs/reference/templates; do
+            if [ -e "$p" ]; then echo "OK   $p"; else echo "MISSING $p"; fi
+          done
+
+      - name: Package full vendored tree
+        run: |
+          tar --exclude='./.git' -czf openclaw-build.tar.gz -C openclaw-dist .
+          ls -lh openclaw-build.tar.gz
+
+      - name: Upload openclaw-build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: openclaw-dist
-          path: openclaw-dist/dist/
+          name: openclaw-build-${{ inputs.openclaw_ref }}
+          path: openclaw-build.tar.gz
           retention-days: 7
