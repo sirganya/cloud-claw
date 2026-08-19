@@ -29,25 +29,10 @@ RUN set -eux; \
 	rm -f /tmp/gh.tar.gz; \
 	rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
-# node_modules split into layers by size (~2.3GB total)
-# Layer 1: largest scoped packages (~650MB)
-COPY openclaw-build/node_modules/@github /openclaw/node_modules/@github
-COPY openclaw-build/node_modules/@anthropic-ai /openclaw/node_modules/@anthropic-ai
-# Layer 2: AI/ML packages (~520MB)
-COPY openclaw-build/node_modules/@openai /openclaw/node_modules/@openai
-COPY openclaw-build/node_modules/@zed-industries /openclaw/node_modules/@zed-industries
-COPY openclaw-build/node_modules/openclaw /openclaw/node_modules/openclaw
-COPY openclaw-build/node_modules/@lancedb /openclaw/node_modules/@lancedb
-# Layer 3: remaining scoped packages
-COPY openclaw-build/node_modules/@tloncorp /openclaw/node_modules/@tloncorp
-COPY openclaw-build/node_modules/@opentelemetry /openclaw/node_modules/@opentelemetry
-COPY openclaw-build/node_modules/@azure /openclaw/node_modules/@azure
-COPY openclaw-build/node_modules/@typescript /openclaw/node_modules/@typescript
-COPY openclaw-build/node_modules/@larksuiteoapi /openclaw/node_modules/@larksuiteoapi
-COPY openclaw-build/node_modules/@slack /openclaw/node_modules/@slack
-COPY openclaw-build/node_modules/@mistralai /openclaw/node_modules/@mistralai
-COPY openclaw-build/node_modules/@pierre /openclaw/node_modules/@pierre
-# Layer 4: everything else
+# node_modules — single COPY. The former per-scoped-package COPY split was a
+# layer-caching optimization, but it hardcoded scoped dirs that drift across
+# OpenClaw upgrades (e.g. @zed-industries was dropped in 2026.8.1, breaking the
+# build). One COPY is upgrade-robust; total image size is unchanged.
 COPY openclaw-build/node_modules /openclaw/node_modules
 
 # Config and package files
@@ -66,9 +51,11 @@ COPY openclaw-build/docs/reference/templates/ /openclaw/src/agents/templates/
 # Patch: skip secret-dir permission check on FUSE mounts (TigrisFS ignores chmod)
 RUN sed -i 's/if (process.platform === "win32") return;/if (process.platform === "win32" || process.env.OPENCLAW_SKIP_FS_PERMISSION_CHECK === "1") return;/' /openclaw/dist/secret-file-*.js
 
-# Patch: deterministic session revision to fix "reply session initialization conflicted" (#key-ordering)
-RUN sed -i 's/function createReplySessionInitializationRevision(entry) {/function _canonicalize(v){if(v===null||typeof v!=="object")return v;if(Array.isArray(v))return v.map(_canonicalize);var r={};Object.keys(v).sort().forEach(function(k){if(v[k]!==undefined)r[k]=_canonicalize(v[k])});return r}function createReplySessionInitializationRevision(entry) {/' /openclaw/dist/session-accessor-*.js
-RUN sed -i 's/return JSON.stringify(entry ?? null);/return JSON.stringify(_canonicalize(entry ?? null));/' /openclaw/dist/session-accessor-*.js
+# (Removed on the 2026.8.1-beta.2 upgrade: the session-accessor canonical-revision
+# patch is superseded by upstream's native canonical session system, and
+# gemini-3.7-flash is now a first-class model in the Google catalog — so neither
+# the session-revision nor the 3.7-flash resolver patch is needed. The secret-file
+# patch above and the targets patch below remain load-bearing.)
 
 # Patch: also accept the bridge's own SA OIDC token for local webhook auth (#bridge-auth)
 # The chat-bridge signs with the app's SA, not chat@system.gserviceaccount.com.
@@ -526,7 +513,7 @@ cat > "$OPENCLAW_STATE_DIR/openclaw.json" << EOFCONFIG
   "agents": {
     "defaults": {
       "model": {
-        "primary": "google/gemini-3.5-flash"
+        "primary": "google/gemini-3.7-flash"
       },
       "contextTokens": 65536,
       "contextPruning": {
@@ -599,25 +586,29 @@ echo "[INFO] MEMORY.md seeded in workspace"
 fi
 
 # Progress-updates instruction: appended once (marker-guarded) to the restored
-# workspace AGENTS.md. Google Chat has no live status edits like Telegram, so
-# the agent itself must narrate long tasks.
+# workspace AGENTS.md. The beta googlechat plugin shows a native "is typing"
+# placeholder (typingIndicator defaults to "message", thread-correct) and
+# streams the reply, so the agent should NOT post manual "on it" filler — that
+# now duplicates the platform's own status. Keep only sparse milestones for long
+# tasks. (Marker-guarded; the live R2-persisted copy is authoritative — this
+# only seeds a fresh workspace.)
 if ! grep -q 'cloud-claw:progress-updates' "$OPENCLAW_WORKSPACE_DIR/AGENTS.md" 2>/dev/null; then
 cat >> "$OPENCLAW_WORKSPACE_DIR/AGENTS.md" << 'EOFPROGRESS'
 
 <!-- cloud-claw:progress-updates -->
 ## Progress updates (operator instruction)
 
-Google Chat cannot show your working status, so narrate it yourself. For any
-task likely to take more than ~20 seconds (multiple tool calls, browsing,
-searches, file work):
+Google Chat now shows a native "_Quickly is typing..._" placeholder while you
+work, and your reply streams in as you write it. So do NOT post "on it" /
+"still working" filler messages — that clutters the thread on top of the
+placeholder the platform already shows.
 
-- Post a one-line message when you start, e.g. "On it — searching the docs...".
-- Post a short update after each significant step, roughly every 30 seconds of
-  work, e.g. "Found 3 candidates, checking each...".
-- Keep updates to a single short line. Never repeat a previous update.
-- Then send the actual answer as a normal final message.
-
-Do not do this for quick replies — only when real work is happening.
+- Most tasks: just work, then answer. The placeholder covers the wait.
+- Only for genuinely long, multi-stage work (deep research, multi-site
+  browsing): post at most one or two short milestone lines when a real phase
+  finishes ("Found 4 tenders, checking each..."). Never a heartbeat every N
+  seconds, and never repeat a previous update.
+- Send the actual answer as your normal final message.
 EOFPROGRESS
 echo "[INFO] Progress-updates instruction appended to workspace AGENTS.md"
 fi
@@ -700,10 +691,27 @@ if (process.env.TELEGRAM_BOT_TOKEN) {
     botToken: process.env.TELEGRAM_BOT_TOKEN,
     dmPolicy: 'allowlist',
     groupPolicy: 'allowlist',
-    allowFrom: ['8667624550'],
-    groupAllowFrom: ['8667624550']
+    allowFrom: ['8667624550', '8958143785'],
+    groupAllowFrom: ['8667624550', '8958143785']
   };
-  console.log('[INFO] Telegram channel configured');
+  // Webhook mode (only if a secret is set): setting webhookUrl flips the plugin
+  // from long-polling to a webhook listener on webhookPort, and it calls
+  // setWebhook on boot. Unlike polling, this lets an inbound Telegram message
+  // wake a sleeping container (the Worker /telegram route forwards to port 8787
+  // and starts the container). The secret is checked at the Worker and
+  // re-validated by the plugin. Falls back to polling if the secret is absent.
+  if (process.env.TELEGRAM_WEBHOOK_SECRET) {
+    c.channels.telegram.webhookUrl = '${WORKER_URL}/telegram';
+    c.channels.telegram.webhookSecret = process.env.TELEGRAM_WEBHOOK_SECRET;
+    c.channels.telegram.webhookPort = 8787;
+    c.channels.telegram.webhookPath = '/telegram';
+    // Bind 0.0.0.0 (not the 127.0.0.1 default) so the Worker/DO can reach the
+    // listener via containerFetch(port 8787); loopback would be unreachable.
+    c.channels.telegram.webhookHost = '0.0.0.0';
+    console.log('[INFO] Telegram channel configured (webhook mode)');
+  } else {
+    console.log('[INFO] Telegram channel configured (polling mode)');
+  }
 }
 
 // Plugins
@@ -751,6 +759,24 @@ if [ ! -d "$OPENCLAW_WORKSPACE_DIR/skills/github" ]; then
 		echo "[WARN] Skill install failed: @steipete/github (will retry next boot)"
 	fi
 fi
+
+# Beta (2026.8.1) state migration — idempotent, runs before the gateway.
+# The 2026.5.x state DB has a legacy device_bootstrap_tokens table missing the
+# canonical setup_id column; the beta's startup migration verifies integrity and
+# refuses to start until it matches. That table holds Control-UI device-pairing
+# tokens (device auth is disabled here), so dropping the stale-schema table is
+# safe — the beta recreates it correctly. Then doctor --fix applies the config-key
+# migrations (memorySearch→memory.search, googlechat dm.*→dmPolicy/allowFrom,
+# retired controlUi/browser keys). Guard: only drop when setup_id is absent, so
+# already-migrated boots are untouched. Proven against a copy of prod state.
+STATE_DB="$STATE_DIR/state/openclaw.sqlite"
+if [ -f "$STATE_DB" ]; then
+	if ! sqlite3 "$STATE_DB" "SELECT setup_id FROM device_bootstrap_tokens LIMIT 0" >/dev/null 2>&1; then
+		sqlite3 "$STATE_DB" "DROP TABLE IF EXISTS device_bootstrap_tokens" 2>/dev/null \
+			&& echo "[INFO] Dropped legacy device_bootstrap_tokens (pre-2026.8 schema)"
+	fi
+fi
+openclaw doctor --fix || echo "[WARN] doctor --fix reported issues (continuing)"
 
 echo "[INFO] Starting OpenClaw Gateway..."
 echo "[INFO] Visit Web UI for initial setup on first use"
