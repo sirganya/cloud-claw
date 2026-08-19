@@ -7,7 +7,7 @@
     "dev": "wrangler dev --ip 0.0.0.0",
     "start": "wrangler dev",
     "cf-typegen": "wrangler types",
-    "lint": "oxfmt && oxlint",
+    "lint": "oxfmt src/ && oxlint src/",
     "postinstall": "npm run lint"
   },
   "devDependencies": {

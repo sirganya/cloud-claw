@@ -4,6 +4,10 @@ import { forwardRequestToContainer } from './container'
 
 export { AgentContainer } from './container'
 
+// Local port the Telegram plugin's webhook listener binds to inside the
+// container (channels.telegram.webhookPort). Must match the Dockerfile config.
+const TELEGRAM_WEBHOOK_PORT = 8787
+
 function verifyBasicAuth(request: Request): Response | null {
   const username = env.SERVER_USERNAME
   const password = env.SERVER_PASSWORD
@@ -60,6 +64,20 @@ async function handleFetch(request: Request) {
   // /googlechat — Google Chat webhooks use their own bearer auth
   if (url.pathname.startsWith('/googlechat')) {
     return forwardRequestToContainer(request)
+  }
+
+  // /telegram — Telegram webhook. Validate the bot-api secret token here so a
+  // stray request can't wake the container, then forward to the plugin's
+  // webhook listener (its own HTTP server on TELEGRAM_WEBHOOK_PORT, not the
+  // gateway). This is what lets Telegram wake a sleeping container (polling
+  // can't). The plugin re-validates the secret downstream.
+  if (url.pathname.startsWith('/telegram')) {
+    const secret = env.TELEGRAM_WEBHOOK_SECRET
+    const provided = request.headers.get('X-Telegram-Bot-Api-Secret-Token')
+    if (!secret || provided !== secret) {
+      return new Response('Unauthorized', { status: 401 })
+    }
+    return forwardRequestToContainer(request, TELEGRAM_WEBHOOK_PORT)
   }
 
   // All other paths use Basic Auth

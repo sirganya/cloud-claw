@@ -1,4 +1,4 @@
-import { Container } from '@cloudflare/containers'
+import { Container, switchPort } from '@cloudflare/containers'
 import { env } from 'cloudflare:workers'
 
 const PORT = 6658
@@ -133,8 +133,13 @@ export class AgentContainer extends Container {
           id: '1',
           method: 'connect',
           params: {
+            // OpenClaw 2026.8.1 bumped the gateway protocol to v4 with
+            // MIN_CLIENT_PROTOCOL_VERSION=4; offering only v3 made the gateway
+            // reject this operator connect ("closed before connect"), so the DO
+            // never renewed activity and the container drained mid-conversation.
+            // Range 3–4 keeps it working against both the beta and a v3 rollback.
             minProtocol: 3,
-            maxProtocol: 3,
+            maxProtocol: 4,
             client: { id: 'cf-do-watcher', version: '1.0.0', platform: 'cloudflare', mode: 'cli' },
             role: 'operator',
             scopes: ['operator.read'],
@@ -174,8 +179,11 @@ function inDreamWindow(): boolean {
 
 const SINGLETON_CONTAINER_ID = 'cf-singleton-container'
 
-export async function forwardRequestToContainer(request: Request) {
+// port targets a non-default container port (e.g. the Telegram webhook listener
+// on 8787). Omit to hit the gateway on defaultPort. Either way this wakes a
+// sleeping container, which is why Telegram webhooks route through here.
+export async function forwardRequestToContainer(request: Request, port?: number) {
   const objectId = env.AGENT_CONTAINER.idFromName(SINGLETON_CONTAINER_ID)
   const container = env.AGENT_CONTAINER.get(objectId, { locationHint: 'wnam' })
-  return container.fetch(request)
+  return container.fetch(port ? switchPort(request, port) : request)
 }

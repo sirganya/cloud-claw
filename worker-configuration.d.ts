@@ -12,6 +12,7 @@ declare namespace Cloudflare {
 		SERVER_PASSWORD: string;
 		WORKER_URL: string;
 		OPENCLAW_GATEWAY_TOKEN: string;
+		TELEGRAM_WEBHOOK_SECRET: string;
 		S3_ENDPOINT: string;
 		S3_ACCESS_KEY_ID: string;
 		S3_SECRET_ACCESS_KEY: string;
