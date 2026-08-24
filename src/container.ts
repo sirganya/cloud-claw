@@ -140,7 +140,15 @@ export class AgentContainer extends Container {
             // Range 3–4 keeps it working against both the beta and a v3 rollback.
             minProtocol: 3,
             maxProtocol: 4,
-            client: { id: 'cf-do-watcher', version: '1.0.0', platform: 'cloudflare', mode: 'cli' },
+            // v4 also validates client.id against the gateway's canonical id
+            // registry (GATEWAY_CLIENT_IDS); a custom id like 'cf-do-watcher'
+            // fails connect with "must be equal to one of the allowed values".
+            client: {
+              id: 'gateway-client',
+              version: '1.0.0',
+              platform: 'cloudflare',
+              mode: 'backend',
+            },
             role: 'operator',
             scopes: ['operator.read'],
             auth: { token: env.OPENCLAW_GATEWAY_TOKEN },
@@ -186,4 +194,48 @@ export async function forwardRequestToContainer(request: Request, port?: number)
   const objectId = env.AGENT_CONTAINER.idFromName(SINGLETON_CONTAINER_ID)
   const container = env.AGENT_CONTAINER.get(objectId, { locationHint: 'wnam' })
   return container.fetch(port ? switchPort(request, port) : request)
+}
+
+const STARTUP_RETRY_DELAY_MS = 2_000
+// Cold boot (R2 restore + doctor + gateway start) takes ~110s observed; hold
+// the webhook the whole time. If Telegram gives up sooner it just retries.
+const STARTUP_WAIT_BUDGET_MS = 150_000
+// A wedged gateway can accept TCP yet never answer (June FUSE incident kept
+// the DO 'healthy' for ~15 min); without a signal the probe await is unbounded
+// and the 150s deadline is never reached.
+const STARTUP_PROBE_TIMEOUT_MS = 15_000
+const COLD_START_SETTLE_MS = 3_000
+
+// containerFetch only waits for the target port to be listening — a message
+// forwarded seconds into a cold boot reaches a half-initialized gateway and
+// the turn dies with "no queued reply payloads" (observed 2026-08-24). Worse,
+// the Telegram listener on 8787 binds during that window and acks the webhook
+// 2xx, so Telegram never redelivers. Gate forwards on gateway /startup — 503
+// until plugins/sidecars are up, unlike /health which is a pure liveness 200
+// from the moment the port binds (and unlike /ready, which also goes false on
+// ongoing channel-health blips and would starve delivery) — settle briefly
+// after a cold start, and 503 on timeout so Telegram redelivers.
+export async function forwardWhenGatewayReady(request: Request, port: number) {
+  const deadline = Date.now() + STARTUP_WAIT_BUDGET_MS
+  let coldStart = false
+  while (true) {
+    try {
+      const probe = new Request('http://container/startup', {
+        signal: AbortSignal.timeout(STARTUP_PROBE_TIMEOUT_MS),
+      })
+      const startup = await forwardRequestToContainer(probe)
+      if (startup.ok) break
+    } catch {
+      // Container still booting or probe timed out — fall through to retry.
+    }
+    coldStart = true
+    if (Date.now() > deadline) {
+      return new Response('gateway not ready', { status: 503 })
+    }
+    await new Promise((resolve) => setTimeout(resolve, STARTUP_RETRY_DELAY_MS))
+  }
+  if (coldStart) {
+    await new Promise((resolve) => setTimeout(resolve, COLD_START_SETTLE_MS))
+  }
+  return forwardRequestToContainer(request, port)
 }

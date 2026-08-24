@@ -1,6 +1,6 @@
 import { env } from 'cloudflare:workers'
 import { proxyCdp } from './cdp'
-import { forwardRequestToContainer } from './container'
+import { forwardRequestToContainer, forwardWhenGatewayReady } from './container'
 
 export { AgentContainer } from './container'
 
@@ -77,7 +77,7 @@ async function handleFetch(request: Request) {
     if (!secret || provided !== secret) {
       return new Response('Unauthorized', { status: 401 })
     }
-    return forwardRequestToContainer(request, TELEGRAM_WEBHOOK_PORT)
+    return forwardWhenGatewayReady(request, TELEGRAM_WEBHOOK_PORT)
   }
 
   // All other paths use Basic Auth
