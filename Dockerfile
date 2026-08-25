@@ -1,3 +1,22 @@
+# Split stage: bucket node_modules into four roughly equal dirs so the final
+# image carries four ~250MB-compressed layers instead of one >1GB blob — that
+# single blob's upload reliably dies mid-push to the Cloudflare registry
+# (broken pipe through Docker Desktop's forwarder on a slow uplink; three
+# consecutive failures on the same digest, 2026-08-24). Stage layers are never
+# pushed; only the final COPY --from layers are. Round-robin over ~900 package
+# dirs balances the buckets without hardcoding package names (which drift
+# across OpenClaw upgrades).
+FROM nikolaik/python-nodejs:python3.12-nodejs22-bookworm AS nm-split
+COPY openclaw-build/node_modules /nm
+RUN set -eux; \
+	mkdir -p /nm1 /nm2 /nm3 /nm4; \
+	i=0; \
+	for d in /nm/* /nm/.[!.]*; do \
+		[ -e "$d" ] || continue; \
+		i=$(( i % 4 + 1 )); \
+		mv "$d" "/nm$i/"; \
+	done
+
 FROM nikolaik/python-nodejs:python3.12-nodejs22-bookworm
 
 ENV NODE_ENV=production
@@ -29,11 +48,13 @@ RUN set -eux; \
 	rm -f /tmp/gh.tar.gz; \
 	rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
-# node_modules — single COPY. The former per-scoped-package COPY split was a
-# layer-caching optimization, but it hardcoded scoped dirs that drift across
-# OpenClaw upgrades (e.g. @zed-industries was dropped in 2026.8.1, breaking the
-# build). One COPY is upgrade-robust; total image size is unchanged.
-COPY openclaw-build/node_modules /openclaw/node_modules
+# node_modules — four overlay COPYs from the nm-split stage (see above). The
+# buckets merge back into one directory; relative symlinks (.bin etc.) resolve
+# again once all four layers are applied.
+COPY --from=nm-split /nm1 /openclaw/node_modules
+COPY --from=nm-split /nm2 /openclaw/node_modules
+COPY --from=nm-split /nm3 /openclaw/node_modules
+COPY --from=nm-split /nm4 /openclaw/node_modules
 
 # Config and package files
 COPY openclaw-build/extensions /openclaw/extensions
@@ -515,7 +536,7 @@ cat > "$OPENCLAW_STATE_DIR/openclaw.json" << EOFCONFIG
       "model": {
         "primary": "google/gemini-3.7-flash"
       },
-      "contextTokens": 65536,
+      "contextTokens": 262144,
       "contextPruning": {
         "mode": "cache-ttl",
         "ttl": "5m"
